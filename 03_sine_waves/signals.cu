@@ -38,10 +38,10 @@ int main(void)
 
     // Create a device vector to hold out input waveform
     nvtxRangePushA("Memory Initialization");
-    auto wave1 = thrust::transform_iterator(thrust::counting_iterator<int>(0), sine_wave_functor(1, 2 * M_PI * FREQ_A / SAMPLE_RATE, 0));
-    auto wave2 = thrust::transform_iterator(thrust::counting_iterator<int>(0), sine_wave_functor(0.5, 2 * M_PI * FREQ_E / SAMPLE_RATE, 0));
-    const auto waves = thrust::make_zip_iterator(wave1, wave2);
-    const auto initializer = thrust::make_transform_iterator(waves, [] __host__ __device__(thrust::tuple<float, float> const &t)
+    auto wave1 = thrust::make_transform_iterator(thrust::counting_iterator<int>(0), sine_wave_functor(1, 2 * M_PI * FREQ_A / SAMPLE_RATE, 0));
+    auto wave2 = thrust::make_transform_iterator(thrust::counting_iterator<int>(0), sine_wave_functor(0.5, 2 * M_PI * FREQ_E / SAMPLE_RATE, 0));
+    const auto waves = thrust::make_zip_iterator(thrust::make_tuple(wave1, wave2));
+    const auto initializer = thrust::make_transform_iterator(waves, [] __host__ __device__(thrust::tuple<float, float> const &t) -> float
                                                              { return thrust::get<0>(t) + thrust::get<1>(t); });
     thrust::device_vector<float> d_combined(initializer, initializer + NUM_SAMPLES);
 
