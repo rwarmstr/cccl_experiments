@@ -38,37 +38,23 @@ int main(void)
 
     // Create a device vector to hold out input waveform
     nvtxRangePushA("Memory Initialization");
-    thrust::device_vector<float> d_vec(NUM_SAMPLES);
-    thrust::device_vector<float> d_vec2(NUM_SAMPLES);
-    thrust::device_vector<float> d_combined(NUM_SAMPLES);
-
-    // Initialize the two device vectors
-    nvtxRangePushA("Populate waves");
-    thrust::tabulate(
-        d_vec.begin(),
-        d_vec.end(),
-        sine_wave_functor(1, 2 * M_PI * FREQ_A / SAMPLE_RATE, 0));
-    thrust::tabulate(
-        d_vec2.begin(),
-        d_vec2.end(),
-        sine_wave_functor(0.5, 2 * M_PI * FREQ_E / SAMPLE_RATE, 0));
-    nvtxRangePop();
-
-    // Add all of the component waves
-    nvtxRangePushA("Add waves");
-    thrust::transform(d_vec.begin(), d_vec.end(), d_vec2.begin(), d_combined.begin(), thrust::plus<float>());
-    nvtxRangePop();
+    auto wave1 = thrust::transform_iterator(thrust::counting_iterator<int>(0), sine_wave_functor(1, 2 * M_PI * FREQ_A / SAMPLE_RATE, 0));
+    auto wave2 = thrust::transform_iterator(thrust::counting_iterator<int>(0), sine_wave_functor(0.5, 2 * M_PI * FREQ_E / SAMPLE_RATE, 0));
+    const auto waves = thrust::make_zip_iterator(wave1, wave2);
+    const auto initializer = thrust::make_transform_iterator(waves, [] __host__ __device__(thrust::tuple<float, float> const &t)
+                                                             { return thrust::get<0>(t) + thrust::get<1>(t); });
+    thrust::device_vector<float> d_combined(initializer, initializer + NUM_SAMPLES);
 
     nvtxRangePop();
 
     // Now let's do an FFT on the combined waveform
-    nvtxRangePushA("FFT");
     cufftHandle plan;
     cufftResult result;
 
     int complex_size = NUM_SAMPLES / 2 + 1;
     thrust::device_vector<cufftComplex> d_fft(complex_size);
 
+    nvtxRangePushA("FFT");
     result = cufftPlan1d(&plan, NUM_SAMPLES, CUFFT_R2C, 1);
     if (result != CUFFT_SUCCESS)
     {
