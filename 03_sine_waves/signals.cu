@@ -81,12 +81,15 @@ int main(void)
     thrust::device_vector<cufftComplex> d_fft(complex_size);
 
     nvtxRangePushA("FFT");
+    nvtxRangePushA("Create Plan");
     result = cufftPlan1d(&plan, NUM_SAMPLES, CUFFT_R2C, 1);
     if (result != CUFFT_SUCCESS)
     {
         std::cout << "CUFFT Error: Plan creation failed" << std::endl;
         return EXIT_FAILURE;
     }
+    nvtxRangePop();
+    nvtxRangePushA("Execute");
 
     result = cufftExecR2C(plan, d_combined.data().get(), d_fft.data().get());
     if (result != CUFFT_SUCCESS)
@@ -94,6 +97,7 @@ int main(void)
         std::cout << "CUFFT Error: ExecR2C failed" << std::endl;
         return EXIT_FAILURE;
     }
+    nvtxRangePop();
     nvtxRangePop();
 
     // On-device magnitude spectrum
