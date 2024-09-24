@@ -29,6 +29,33 @@ struct sine_wave_functor
     }
 };
 
+struct add_waves
+{
+    __host__ __device__ float operator()(const thrust::tuple<float, float> &t) const
+    {
+        return thrust::get<0>(t) + thrust::get<1>(t);
+    }
+};
+
+void write_results(std::string filename, std::vector<float> &data)
+{
+    nvtxRangePushA(("Write results: " + filename).c_str());
+    std::ofstream outfile("filename");
+    if (outfile.is_open())
+    {
+        for (auto &val : data)
+        {
+            outfile << val << "\n";
+        }
+        outfile.close();
+    }
+    else
+    {
+        std::cout << "Unable to open file " << filename << std::endl;
+    }
+    nvtxRangePop();
+}
+
 int main(void)
 {
     // Quick call to cudaFree to ensure context creation
@@ -41,8 +68,7 @@ int main(void)
     auto wave1 = thrust::make_transform_iterator(thrust::counting_iterator<int>(0), sine_wave_functor(1, 2 * M_PI * FREQ_A / SAMPLE_RATE, 0));
     auto wave2 = thrust::make_transform_iterator(thrust::counting_iterator<int>(0), sine_wave_functor(0.5, 2 * M_PI * FREQ_E / SAMPLE_RATE, 0));
     const auto waves = thrust::make_zip_iterator(thrust::make_tuple(wave1, wave2));
-    const auto initializer = thrust::make_transform_iterator(waves, [] __host__ __device__(thrust::tuple<float, float> const &t) -> float
-                                                             { return thrust::get<0>(t) + thrust::get<1>(t); });
+    const auto initializer = thrust::make_transform_iterator(waves, add_waves());
     thrust::device_vector<float> d_combined(initializer, initializer + NUM_SAMPLES);
 
     nvtxRangePop();
@@ -85,35 +111,9 @@ int main(void)
     thrust::copy(d_mags.begin(), d_mags.end(), h_mags.begin());
     nvtxRangePop();
 
-    nvtxRangePushA("Write results");
-    std::ofstream outfile("output.csv");
-    if (outfile.is_open())
-    {
-        for (auto &val : h_combined)
-        {
-            outfile << val << "\n";
-        }
-        outfile.close();
-    }
-    else
-    {
-        std::cout << "Unable to open file" << std::endl;
-    }
-
-    std::ofstream of2("mags.csv");
-    if (of2.is_open())
-    {
-        for (auto &val : h_mags)
-        {
-            of2 << val << "\n";
-        }
-        of2.close();
-    }
-    else
-    {
-        std::cout << "Unable to open file" << std::endl;
-    }
-    nvtxRangePop();
+    // Write the results to a file
+    write_results("combined.csv", h_combined);
+    write_results("mags.csv", h_mags);
 
     return EXIT_SUCCESS;
 }
