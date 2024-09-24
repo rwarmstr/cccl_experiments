@@ -1,7 +1,7 @@
 #include <cub/cub.cuh>
+#include <thrust/copy.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
-#include <thrust/copy.h>
 
 struct square_t
 {
@@ -38,8 +38,7 @@ int main(void)
     thrust::copy(img.begin(), img.end(), result.begin());
 
     std::cout << "< ";
-    for (int element : result)
-    {
+    for (int element : result) {
         std::cout << element << " ";
     }
 

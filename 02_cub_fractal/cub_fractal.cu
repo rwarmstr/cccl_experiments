@@ -1,8 +1,8 @@
-#include <iostream>
 #include <cub/cub.cuh>
-#include <thrust/device_vector.h>
-#include <thrust/complex.h>
+#include <iostream>
 #include <opencv2/opencv.hpp>
+#include <thrust/complex.h>
+#include <thrust/device_vector.h>
 
 struct fractal_t
 {
@@ -15,8 +15,7 @@ struct fractal_t
 
     __device__ void operator()(int i)
     {
-        if (i >= width * height)
-        {
+        if (i >= width * height) {
             return;
         }
 
@@ -30,28 +29,25 @@ struct fractal_t
 
         int it = 0;
 
-        while (thrust::abs(z) < 2.0f && it < iterations)
-        {
+        while (thrust::abs(z) < 2.0f && it < iterations) {
             z = (z * z) + c;
             it++;
         }
 
-        if (it == iterations)
-        {
+        if (it == iterations) {
             d_ptr[i] = 0;
         }
-        else
-        {
-            d_ptr[i] = (uint8_t)((255.0f * it) / iterations);
+        else {
+            d_ptr[i] = (std::uint8_t)((255.0f * it) / iterations);
         }
     }
 };
 
 int main(void)
 {
-    int width = 1920;
+    int width  = 1920;
     int height = 1080;
-    int size = width * height;
+    int size   = width * height;
 
     // Force creation of a CUDA context
     cudaFree(0);
@@ -61,11 +57,11 @@ int main(void)
 
     // Create a fractal object and set its parameters
     fractal_t fractal;
-    fractal.d_ptr = thrust::raw_pointer_cast(d_image.data());
-    fractal.width = width;
-    fractal.height = height;
-    fractal.min = std::complex<float>(-2.5f, -1.0f);
-    fractal.max = std::complex<float>(1.0f, 1.0f);
+    fractal.d_ptr      = thrust::raw_pointer_cast(d_image.data());
+    fractal.width      = width;
+    fractal.height     = height;
+    fractal.min        = std::complex<float>(-2.5f, -1.0f);
+    fractal.max        = std::complex<float>(1.0f, 1.0f);
     fractal.iterations = 256;
 
     std::uint8_t *d_temp_storage{};
@@ -80,10 +76,12 @@ int main(void)
     cub::DeviceFor::Bulk(d_temp_storage, temp_storage_bytes, d_image.size(), fractal);
 
     cv::Mat image(height, width, CV_8UC1);
-    std::cout << image.step << std::endl;
 
     // Copy from device to host
-    cudaMemcpy(image.data, thrust::raw_pointer_cast(d_image.data()), size * sizeof(std::uint8_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(image.data,
+               thrust::raw_pointer_cast(d_image.data()),
+               size * sizeof(std::uint8_t),
+               cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
 
     cv::imwrite("mandelbrot.png", image);

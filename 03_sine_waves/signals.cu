@@ -1,10 +1,10 @@
-#include <iostream>
+#include <array>
+#include <cufft.h>
 #include <fstream>
+#include <iostream>
+#include <nvtx3/nvToolsExt.h>
 #include <thrust/device_vector.h>
 #include <thrust/tabulate.h>
-#include <cufft.h>
-#include <array>
-#include <nvtx3/nvToolsExt.h>
 
 #define NUM_SAMPLES (1024 * 1024)
 
@@ -41,16 +41,13 @@ void write_results(std::string filename, std::vector<float> &data)
 {
     nvtxRangePushA(("Write results: " + filename).c_str());
     std::ofstream outfile("filename");
-    if (outfile.is_open())
-    {
-        for (auto &val : data)
-        {
+    if (outfile.is_open()) {
+        for (auto &val : data) {
             outfile << val << "\n";
         }
         outfile.close();
     }
-    else
-    {
+    else {
         std::cout << "Unable to open file " << filename << std::endl;
     }
     nvtxRangePop();
@@ -65,9 +62,11 @@ int main(void)
 
     // Create a device vector to hold out input waveform
     nvtxRangePushA("Memory Initialization");
-    auto wave1 = thrust::make_transform_iterator(thrust::counting_iterator<int>(0), sine_wave_functor(1, 2 * M_PI * FREQ_A / SAMPLE_RATE, 0));
-    auto wave2 = thrust::make_transform_iterator(thrust::counting_iterator<int>(0), sine_wave_functor(0.5, 2 * M_PI * FREQ_E / SAMPLE_RATE, 0));
-    const auto waves = thrust::make_zip_iterator(thrust::make_tuple(wave1, wave2));
+    auto wave1             = thrust::make_transform_iterator(thrust::counting_iterator<int>(0),
+                                                             sine_wave_functor(1, 2 * M_PI * FREQ_A / SAMPLE_RATE, 0));
+    auto wave2             = thrust::make_transform_iterator(thrust::counting_iterator<int>(0),
+                                                             sine_wave_functor(0.5, 2 * M_PI * FREQ_E / SAMPLE_RATE, 0));
+    const auto waves       = thrust::make_zip_iterator(thrust::make_tuple(wave1, wave2));
     const auto initializer = thrust::make_transform_iterator(waves, add_waves());
     thrust::device_vector<float> d_combined(initializer, initializer + NUM_SAMPLES);
 
@@ -83,8 +82,7 @@ int main(void)
     nvtxRangePushA("FFT");
     nvtxRangePushA("Create Plan");
     result = cufftPlan1d(&plan, NUM_SAMPLES, CUFFT_R2C, 1);
-    if (result != CUFFT_SUCCESS)
-    {
+    if (result != CUFFT_SUCCESS) {
         std::cout << "CUFFT Error: Plan creation failed" << std::endl;
         return EXIT_FAILURE;
     }
@@ -92,8 +90,7 @@ int main(void)
     nvtxRangePushA("Execute");
 
     result = cufftExecR2C(plan, d_combined.data().get(), d_fft.data().get());
-    if (result != CUFFT_SUCCESS)
-    {
+    if (result != CUFFT_SUCCESS) {
         std::cout << "CUFFT Error: ExecR2C failed" << std::endl;
         return EXIT_FAILURE;
     }
@@ -102,8 +99,10 @@ int main(void)
 
     // On-device magnitude spectrum
     nvtxRangePushA("FFT bin magnitudes");
-    auto mag = thrust::transform_iterator(d_fft.begin(), [] __host__ __device__(cufftComplex c)
-                                          { return sqrtf(c.x * c.x + c.y * c.y) / NUM_SAMPLES; });
+    auto mag = thrust::transform_iterator(d_fft.begin(),
+                                          [] __host__ __device__(cufftComplex c) {
+                                              return sqrtf(c.x * c.x + c.y * c.y) / NUM_SAMPLES;
+                                          });
     thrust::device_vector<float> d_mags{mag, mag + d_fft.size()};
     nvtxRangePop();
 
