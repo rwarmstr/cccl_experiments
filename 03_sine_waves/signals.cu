@@ -1,10 +1,8 @@
-#include <array>
 #include <cufft.h>
 #include <fstream>
 #include <iostream>
 #include <nvtx3/nvToolsExt.h>
 #include <thrust/device_vector.h>
-#include <thrust/tabulate.h>
 
 #define NUM_SAMPLES (1024 * 1024)
 
