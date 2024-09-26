@@ -3,6 +3,7 @@
 #include <iostream>
 #include <nvtx3/nvToolsExt.h>
 #include <thrust/device_vector.h>
+#include <string>
 
 // Include FFMPeg headers
 extern "C"
@@ -13,12 +14,49 @@ extern "C"
 #include <libavutil/samplefmt.h>
 }
 
+class DeviceFFT
+{
+    private:
+        thrust::device_vector<float> _fft_buf;
+        int _buf_depth = 0;
+
+    public:
+        DeviceFFT() : _fft_buf(4096) {
+            nvtxRangePushA("Context creation");
+            cudaFree(0);
+            nvtxRangePop();
+        }
+
+        void add_sample(float *data, int length)
+        {
+            if (_buf_depth + length <= 4096) {
+                nvtxRangePushA(("Copy in " + std::to_string(length) + " from " + std::to_string(_buf_depth)).c_str());
+                thrust::copy(data, data + length, _fft_buf.begin() + _buf_depth);
+                _buf_depth += length;
+                nvtxRangePop();
+            }
+            else {
+                nvtxRangePushA("Shuffle");
+                nvtxRangePushA(("Move " + std::to_string(length) + " to " + std::to_string(_buf_depth) + " to 0").c_str());
+                thrust::copy(_fft_buf.begin() + length, _fft_buf.begin() + _buf_depth, _fft_buf.begin());
+                nvtxRangePop();
+                nvtxRangePushA("Copy new");
+                thrust::copy(data, data + length, _fft_buf.begin() + _buf_depth - length);
+                nvtxRangePop();
+                nvtxRangePop();
+            }
+        }
+};
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " <input_file>" << std::endl;
         return EXIT_FAILURE;
     }
+
+    // Initialize defice FFT
+    DeviceFFT fft;
 
     std::string video_file = argv[1];
 
@@ -106,6 +144,12 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    // Save the time base of hte audio stream
+    AVRational time_base = format_context->streams[audio_stream_index]->time_base;
+
+    bool first = true;
+    std::uint64_t total_samples = 0;
+    int n = 0;
     while (av_read_frame(format_context, packet) >= 0) {
         if (packet->stream_index == audio_stream_index) {
             int response = avcodec_send_packet(codec_context, packet);
@@ -125,17 +169,41 @@ int main(int argc, char **argv)
                     return EXIT_FAILURE;
                 }
 
+                if (first) {
+                    AVSampleFormat sample_fmt = static_cast<AVSampleFormat>(frame->format);
+                    std::cout << "Sample format: " << av_get_sample_fmt_name(sample_fmt);
+                    std::cout << " - " << (av_sample_fmt_is_planar(sample_fmt) ? "Planar" : "Non-Planar") << std::endl;
+                    first = false;
+                }
+
+                double time_in_seconds = 0.0;
+                if (frame->pts != AV_NOPTS_VALUE) {
+                    time_in_seconds = frame->pts * av_q2d(time_base);
+                }
+                else if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+                    time_in_seconds = frame->best_effort_timestamp * av_q2d(time_base);
+                }
+                else {
+                    // Estimate time based on total samples
+                    total_samples += frame->nb_samples;
+                    time_in_seconds = static_cast<double>(total_samples) / frame->sample_rate;
+                }
+
                 size_t data_size = av_get_bytes_per_sample(codec_context->sample_fmt) * frame->nb_samples;
 
-                std::cout << data_size << std::endl; // * frame->nb_samples * frame->channels;
+                std::cout << "Current: " << time_in_seconds << " - " << data_size << " bytes" << std::endl; // * frame->nb_samples * frame->channels;
+                n++;
+                fft.add_sample(reinterpret_cast<float *>(frame->data[0]), frame->nb_samples);
+                
             }
         }
+        if (n > 10) {
+            break;
+        }
+        av_packet_unref(packet);
     }
 
-    // Quick call to cudaFree to ensure context creation
-    nvtxRangePushA("Context creation");
-    cudaFree(0);
-    nvtxRangePop();
+    
 
     avformat_close_input(&format_context);
 
