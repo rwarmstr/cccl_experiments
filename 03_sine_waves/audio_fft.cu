@@ -2,8 +2,8 @@
 #include <fstream>
 #include <iostream>
 #include <nvtx3/nvToolsExt.h>
-#include <thrust/device_vector.h>
 #include <string>
+#include <thrust/device_vector.h>
 
 // Include FFMPeg headers
 extern "C"
@@ -16,36 +16,42 @@ extern "C"
 
 class DeviceFFT
 {
-    private:
-        thrust::device_vector<float> _fft_buf;
-        int _buf_depth = 0;
+private:
+    thrust::device_vector<float> _fft_buf;
+    int _buf_depth = 0;
 
-    public:
-        DeviceFFT() : _fft_buf(4096) {
-            nvtxRangePushA("Context creation");
-            cudaFree(0);
+public:
+    DeviceFFT() : _fft_buf(4096)
+    {
+        nvtxRangePushA("Context creation");
+        cudaFree(0);
+        nvtxRangePop();
+    }
+
+    void add_sample(float *data, int length)
+    {
+        if (_buf_depth + length <= 4096) {
+            nvtxRangePushA(("Copy in " + std::to_string(length) + " from " + std::to_string(_buf_depth)).c_str());
+            thrust::copy(data, data + length, _fft_buf.begin() + _buf_depth);
+            _buf_depth += length;
             nvtxRangePop();
         }
+        else {
+            nvtxRangePushA("Shuffle");
+            nvtxRangePushA(("Move " + std::to_string(length) + " to " + std::to_string(_buf_depth) + " to 0").c_str());
 
-        void add_sample(float *data, int length)
-        {
-            if (_buf_depth + length <= 4096) {
-                nvtxRangePushA(("Copy in " + std::to_string(length) + " from " + std::to_string(_buf_depth)).c_str());
-                thrust::copy(data, data + length, _fft_buf.begin() + _buf_depth);
-                _buf_depth += length;
-                nvtxRangePop();
-            }
-            else {
-                nvtxRangePushA("Shuffle");
-                nvtxRangePushA(("Move " + std::to_string(length) + " to " + std::to_string(_buf_depth) + " to 0").c_str());
-                thrust::copy(_fft_buf.begin() + length, _fft_buf.begin() + _buf_depth, _fft_buf.begin());
-                nvtxRangePop();
-                nvtxRangePushA("Copy new");
-                thrust::copy(data, data + length, _fft_buf.begin() + _buf_depth - length);
-                nvtxRangePop();
-                nvtxRangePop();
-            }
+            cudaMemcpyAsync(thrust::raw_pointer_cast(_fft_buf.data()),
+                            thrust::raw_pointer_cast(_fft_buf.data() + length),
+                            (_buf_depth - length) * sizeof(float),
+                            cudaMemcpyDeviceToDevice);
+            // thrust::copy(_fft_buf.begin() + length, _fft_buf.begin() + _buf_depth, _fft_buf.begin());
+            nvtxRangePop();
+            nvtxRangePushA("Copy new");
+            thrust::copy(data, data + length, _fft_buf.begin() + _buf_depth - length);
+            nvtxRangePop();
+            nvtxRangePop();
         }
+    }
 };
 
 int main(int argc, char **argv)
@@ -147,9 +153,9 @@ int main(int argc, char **argv)
     // Save the time base of hte audio stream
     AVRational time_base = format_context->streams[audio_stream_index]->time_base;
 
-    bool first = true;
+    bool first                  = true;
     std::uint64_t total_samples = 0;
-    int n = 0;
+    int n                       = 0;
     while (av_read_frame(format_context, packet) >= 0) {
         if (packet->stream_index == audio_stream_index) {
             int response = avcodec_send_packet(codec_context, packet);
@@ -194,7 +200,6 @@ int main(int argc, char **argv)
                 std::cout << "Current: " << time_in_seconds << " - " << data_size << " bytes" << std::endl; // * frame->nb_samples * frame->channels;
                 n++;
                 fft.add_sample(reinterpret_cast<float *>(frame->data[0]), frame->nb_samples);
-                
             }
         }
         if (n > 10) {
@@ -203,7 +208,6 @@ int main(int argc, char **argv)
         av_packet_unref(packet);
     }
 
-    
 
     avformat_close_input(&format_context);
 
