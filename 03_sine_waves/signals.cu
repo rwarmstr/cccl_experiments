@@ -38,7 +38,7 @@ struct add_waves
 void write_results(std::string filename, std::vector<float> &data)
 {
     nvtxRangePushA(("Write results: " + filename).c_str());
-    std::ofstream outfile("filename");
+    std::ofstream outfile(filename);
     if (outfile.is_open()) {
         for (auto &val : data) {
             outfile << val << "\n";
