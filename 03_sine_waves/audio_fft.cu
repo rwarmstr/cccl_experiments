@@ -1,7 +1,9 @@
+#include <cub/cub.cuh>
 #include <cufft.h>
 #include <fstream>
 #include <iostream>
 #include <nvtx3/nvToolsExt.h>
+#include <opencv2/opencv.hpp>
 #include <string>
 #include <thrust/device_vector.h>
 
@@ -24,7 +26,8 @@ private:
     thrust::device_vector<float> _hann;
     thrust::device_vector<cufftComplex> _fft_results;
 
-    size_t _buf_depth = 0;
+    size_t _buf_depth     = 0;
+    int _last_window_size = 0;
 
 public:
     struct hann_functor
@@ -88,8 +91,9 @@ public:
 
         nvtxRangePushA("FFT");
         nvtxRangePushA("Allocate intermediate memory");
-        const int num_batches = (length - window_size) / hop + 1;
-        _fft_results.resize(num_batches * window_size);
+        int _num_batches  = (length - window_size) / hop + 1;
+        _last_window_size = window_size;
+        _fft_results.resize(_num_batches * window_size);
         // thrust::device_vector<cufftComplex> fft_results(num_batches * window_size);
         nvtxRangePop();
 
@@ -105,7 +109,7 @@ public:
         int odist      = window_size; // Distance between the start of each output batch
 
         // Batch mode FFT plan creation
-        cufftPlanMany(&plan, 1, n, inembed, istride, idist, onembed, ostride, odist, CUFFT_R2C, num_batches);
+        cufftPlanMany(&plan, 1, n, inembed, istride, idist, onembed, ostride, odist, CUFFT_R2C, _num_batches);
         nvtxRangePop();
 
         nvtxRangePushA("Execute");
@@ -118,6 +122,77 @@ public:
         nvtxRangePop();
 
         return result;
+    }
+
+    std::vector<float> get_magnitudes()
+    {
+        nvtxRangePushA("Retrieve bin magnitudes");
+        nvtxRangePushA("Transform FFT results");
+        auto mag = thrust::transform_iterator(_fft_results.begin(),
+                                              [this] __host__ __device__(cufftComplex c) {
+                                                  return sqrtf(c.x * c.x + c.y * c.y) / _last_window_size;
+                                              });
+
+        thrust::device_vector<float> mags(mag, mag + _fft_results.size());
+        nvtxRangePop();
+
+        nvtxRangePushA("Allocate host vector");
+        std::vector<float> h_mags(mags.size());
+        nvtxRangePop();
+
+        nvtxRangePushA("Copy to Host");
+        thrust::copy(mags.begin(), mags.end(), h_mags.begin());
+        nvtxRangePop();
+        nvtxRangePop();
+
+        return h_mags;
+    }
+
+    std::vector<std::uint8_t> get_img_magnitudes()
+    {
+        nvtxRangePushA("Retrieve bin magnitudes");
+        nvtxRangePushA("Transform FFT results");
+        auto mag = thrust::transform_iterator(_fft_results.begin(),
+                                              [this] __host__ __device__(cufftComplex c) {
+                                                  return sqrtf(c.x * c.x + c.y * c.y) / _last_window_size;
+                                              });
+
+        thrust::device_vector<float> mags(mag, mag + _fft_results.size());
+        nvtxRangePop();
+
+        nvtxRangePushA("Find Maximum");
+        float *d_max              = nullptr;
+        void *d_temp_storage      = nullptr;
+        size_t temp_storage_bytes = 0;
+
+        cudaMalloc(&d_max, sizeof(float));
+        cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, mags.data().get(), d_max, mags.size());
+        cudaMalloc(&d_temp_storage, temp_storage_bytes);
+        cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, mags.data().get(), d_max, mags.size());
+        cudaFree(d_temp_storage);
+        nvtxRangePop();
+
+        nvtxRangePushA("Convert to normalized uchar");
+        const int k        = 25;
+        auto img_transform = thrust::transform_iterator(mags.begin(),
+                                                        [d_max, k] __host__ __device__(float x) {
+                                                            return (std::uint8_t)((logf(1 + (k * (x / *d_max))) / logf(1 + k)) * 255);
+                                                        });
+        thrust::device_vector<std::uint8_t> img_mags(img_transform, img_transform + mags.size());
+        nvtxRangePop();
+
+        nvtxRangePushA("Allocate host memory");
+        std::vector<std::uint8_t> img(img_mags.size());
+        nvtxRangePop();
+
+        nvtxRangePushA("Copy to Host");
+        thrust::copy(img_mags.begin(), img_mags.end(), img.begin());
+        nvtxRangePop();
+        nvtxRangePop();
+
+        cudaFree(d_max);
+
+        return img;
     }
 };
 
@@ -309,9 +384,30 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    std::vector<std::uint8_t> mags = fft->get_img_magnitudes();
+
+    // std::vector<float> some_mags(mags.begin(), mags.begin() + WINDOW_SIZE * 10);
+
+    // write_csv("video_mags.csv", mags);
+
     std::vector<float> window = fft->get_window_vector();
     write_csv("window.csv", window);
 
+    nvtxRangePushA("Image creation");
+
+    cv::Mat image(full_length / 4096, 4096, CV_8UC1, mags.data());
+    nvtxRangePushA("Crop");
+    cv::Mat cropped_image = image(cv::Rect(0, 0, 200, image.rows));
+    nvtxRangePop();
+    nvtxRangePushA("Transpose");
+    cv::rotate(cropped_image, cropped_image, cv::ROTATE_90_COUNTERCLOCKWISE);
+    nvtxRangePop();
+
+    nvtxRangePushA("Write");
+
+    cv::imwrite("fft.png", cropped_image);
+    nvtxRangePop();
+    nvtxRangePop();
 
     return EXIT_SUCCESS;
 }

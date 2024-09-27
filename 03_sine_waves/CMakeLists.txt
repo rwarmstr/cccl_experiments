@@ -29,6 +29,9 @@ set(FFMPEG_LIBS
     ${AVUTIL_LIBRARIES}
 )
 
+find_package( OpenCV REQUIRED )
+include_directories( ${OpenCV_INCLUDE_DIRS} )
+
 add_executable(audio_fft
     audio_fft.cu
 )
@@ -42,6 +45,7 @@ target_include_directories(audio_fft PRIVATE
 target_link_libraries(audio_fft
     CUDA::cufft
     ${FFMPEG_LIBS}
+    ${OpenCV_LIBS}
 )
 
 # Include definitions and compiler options for FFMPeg libraries as needed
