@@ -30,6 +30,50 @@ private:
     int _last_window_size = 0;
 
 public:
+    void normalize_values()
+    {
+        nvtxRangePushA("Normalize input values");
+        float *d_max              = nullptr;
+        void *d_temp_storage      = nullptr;
+        size_t temp_storage_bytes = 0;
+
+        nvtxRangePushA("Find max");
+        auto abs_it = thrust::transform_iterator(_fft_buf.begin(),
+                                                 [] __host__ __device__(float x) {
+                                                     return cuda::std::abs(x);
+                                                 });
+
+        cudaMalloc(&d_max, sizeof(float));
+        cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, abs_it, d_max, _fft_buf.size());
+        cudaMalloc(&d_temp_storage, temp_storage_bytes);
+        cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, abs_it, d_max, _fft_buf.size());
+        cudaFree(d_temp_storage);
+        nvtxRangePop();
+
+        float max_value;
+        cudaMemcpy(&max_value, d_max, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaDeviceSynchronize();
+        std::cout << "Max value in array: " << max_value << std::endl;
+
+        nvtxRangePushA("Normalize");
+
+        auto normalize_op = [d_max] __device__(float &x) {
+            x = x / *d_max;
+        };
+
+        temp_storage_bytes = 0;
+        d_temp_storage     = nullptr;
+        cub::DeviceFor::ForEach(d_temp_storage, temp_storage_bytes, _fft_buf.begin(), _fft_buf.end(), normalize_op);
+        cudaMalloc(&d_temp_storage, temp_storage_bytes);
+        cub::DeviceFor::ForEach(d_temp_storage, temp_storage_bytes, _fft_buf.begin(), _fft_buf.end(), normalize_op);
+        cudaFree(d_temp_storage);
+
+        cudaFree(d_max);
+        nvtxRangePop();
+        nvtxRangePop();
+    }
+
+
     struct hann_functor
     {
         size_t window_size;
@@ -85,7 +129,7 @@ public:
         return window;
     }
 
-    cufftResult run_batch_fft(int length, int window_size, int hop)
+    cufftResult run_batch_fft(int length, int window_size, int hop, bool normalize = true)
     {
         cufftResult result;
 
@@ -96,6 +140,10 @@ public:
         _fft_results.resize(_num_batches * window_size);
         // thrust::device_vector<cufftComplex> fft_results(num_batches * window_size);
         nvtxRangePop();
+
+        if (normalize) {
+            normalize_values();
+        }
 
         nvtxRangePushA("Create Plan");
         // Create cuFFT plan
@@ -308,12 +356,9 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Save the time base of hte audio stream
-    AVRational time_base = format_context->streams[audio_stream_index]->time_base;
 
-    bool first                  = true;
-    std::uint64_t total_samples = 0;
-    size_t full_length          = 0;
+    bool first         = true;
+    size_t full_length = 0;
 
 
     while (av_read_frame(format_context, packet) >= 0) {
@@ -348,22 +393,7 @@ int main(int argc, char **argv)
                     first = false;
                 }
 
-                double time_in_seconds = 0.0;
-                if (frame->pts != AV_NOPTS_VALUE) {
-                    time_in_seconds = frame->pts * av_q2d(time_base);
-                }
-                else if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-                    time_in_seconds = frame->best_effort_timestamp * av_q2d(time_base);
-                }
-                else {
-                    // Estimate time based on total samples
-                    total_samples += frame->nb_samples;
-                    time_in_seconds = static_cast<double>(total_samples) / frame->sample_rate;
-                }
-
                 size_t data_size = av_get_bytes_per_sample(codec_context->sample_fmt) * frame->nb_samples;
-
-                // std::cout << "Current: " << time_in_seconds << " - " << data_size << " bytes" << std::endl; // * frame->nb_samples * frame->channels;
 
                 fft->add_sample(reinterpret_cast<float *>(frame->data[0]), frame->nb_samples);
             }
@@ -384,28 +414,32 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+
+    std::vector<float> float_mags = fft->get_magnitudes();
+    write_csv("video_mags.csv", float_mags);
+
     std::vector<std::uint8_t> mags = fft->get_img_magnitudes();
-
-    // std::vector<float> some_mags(mags.begin(), mags.begin() + WINDOW_SIZE * 10);
-
-    // write_csv("video_mags.csv", mags);
 
     std::vector<float> window = fft->get_window_vector();
     write_csv("window.csv", window);
 
     nvtxRangePushA("Image creation");
 
-    cv::Mat image(full_length / 4096, 4096, CV_8UC1, mags.data());
+    cv::Mat image(full_length / HOP_SIZE, WINDOW_SIZE, CV_8UC1, mags.data());
     nvtxRangePushA("Crop");
-    cv::Mat cropped_image = image(cv::Rect(0, 0, 200, image.rows));
+    cv::Mat cropped_image = image(cv::Rect(0, 0, 400, image.rows));
     nvtxRangePop();
     nvtxRangePushA("Transpose");
     cv::rotate(cropped_image, cropped_image, cv::ROTATE_90_COUNTERCLOCKWISE);
+    cv::Mat color_image;
+
+    // Apply a colormap. Options include COLORMAP_JET, COLORMAP_HOT, COLORMAP_COOL, etc.
+    cv::applyColorMap(cropped_image, color_image, cv::COLORMAP_JET);
     nvtxRangePop();
 
     nvtxRangePushA("Write");
 
-    cv::imwrite("fft.png", cropped_image);
+    cv::imwrite("fft.png", color_image);
     nvtxRangePop();
     nvtxRangePop();
 
