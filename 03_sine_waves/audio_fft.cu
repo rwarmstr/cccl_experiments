@@ -14,14 +14,36 @@ extern "C"
 #include <libavutil/samplefmt.h>
 }
 
+#define WINDOW_SIZE (4096)
+#define HOP_SIZE (1024)
+
 class DeviceFFT
 {
 private:
     thrust::device_vector<float> _fft_buf;
-    int _buf_depth = 0;
+    thrust::device_vector<float> _hann;
+    thrust::device_vector<cufftComplex> _fft_results;
+
+    size_t _buf_depth = 0;
 
 public:
-    DeviceFFT() : _fft_buf(4096)
+    struct hann_functor
+    {
+        size_t window_size;
+
+        __host__ __device__
+        hann_functor(size_t _window_size) : window_size(_window_size) {}
+
+        __host__ __device__ float operator()(const int &index) const
+        {
+            return 0.5f * (1.0f - cosf((2.0f * M_PI * index) / window_size));
+        }
+    };
+
+
+    DeviceFFT(size_t buffer_size, size_t window_size) : _fft_buf(buffer_size),
+                                                        _hann(thrust::make_transform_iterator(thrust::counting_iterator<int>(0), hann_functor(window_size)),
+                                                              thrust::make_transform_iterator(thrust::counting_iterator<int>(window_size), hann_functor(window_size)))
     {
         nvtxRangePushA("Context creation");
         cudaFree(0);
@@ -30,7 +52,7 @@ public:
 
     void add_sample(float *data, int length)
     {
-        if (_buf_depth + length <= 4096) {
+        if (_buf_depth + length <= _fft_buf.size()) {
             nvtxRangePushA(("Copy in " + std::to_string(length) + " from " + std::to_string(_buf_depth)).c_str());
             thrust::copy(data, data + length, _fft_buf.begin() + _buf_depth);
             _buf_depth += length;
@@ -44,7 +66,6 @@ public:
                             thrust::raw_pointer_cast(_fft_buf.data() + length),
                             (_buf_depth - length) * sizeof(float),
                             cudaMemcpyDeviceToDevice);
-            // thrust::copy(_fft_buf.begin() + length, _fft_buf.begin() + _buf_depth, _fft_buf.begin());
             nvtxRangePop();
             nvtxRangePushA("Copy new");
             thrust::copy(data, data + length, _fft_buf.begin() + _buf_depth - length);
@@ -52,7 +73,69 @@ public:
             nvtxRangePop();
         }
     }
+
+    std::vector<float> get_window_vector()
+    {
+        std::vector<float> window(_hann.size());
+        thrust::copy(_hann.begin(), _hann.end(), window.begin());
+
+        return window;
+    }
+
+    cufftResult run_batch_fft(int length, int window_size, int hop)
+    {
+        cufftResult result;
+
+        nvtxRangePushA("FFT");
+        nvtxRangePushA("Allocate intermediate memory");
+        const int num_batches = (length - window_size) / hop + 1;
+        _fft_results.resize(num_batches * window_size);
+        // thrust::device_vector<cufftComplex> fft_results(num_batches * window_size);
+        nvtxRangePop();
+
+        nvtxRangePushA("Create Plan");
+        // Create cuFFT plan
+        cufftHandle plan;
+        int n[1]       = {window_size}; // FFT size is 4096
+        int inembed[1] = {length};      // Input size per batch
+        int istride    = 1;             // Stride between samples in a batch
+        int idist      = hop;           // Distance between the start of each batch (hop size)
+        int onembed[1] = {window_size}; // Output size per batch (same as input in 1D FFT)
+        int ostride    = 1;
+        int odist      = window_size; // Distance between the start of each output batch
+
+        // Batch mode FFT plan creation
+        cufftPlanMany(&plan, 1, n, inembed, istride, idist, onembed, ostride, odist, CUFFT_R2C, num_batches);
+        nvtxRangePop();
+
+        nvtxRangePushA("Execute");
+        result = cufftExecR2C(plan, _fft_buf.data().get(), _fft_results.data().get());
+        if (result != CUFFT_SUCCESS) {
+            std::cout << "CUFFT Error: ExecR2C failed" << std::endl;
+            return result;
+        }
+        nvtxRangePop();
+        nvtxRangePop();
+
+        return result;
+    }
 };
+
+void write_csv(std::string filename, std::vector<float> &data)
+{
+    nvtxRangePushA(("Write results: " + filename).c_str());
+    std::ofstream outfile(filename);
+    if (outfile.is_open()) {
+        for (auto &val : data) {
+            outfile << val << "\n";
+        }
+        outfile.close();
+    }
+    else {
+        std::cout << "Unable to open file " << filename << std::endl;
+    }
+    nvtxRangePop();
+}
 
 int main(int argc, char **argv)
 {
@@ -62,7 +145,7 @@ int main(int argc, char **argv)
     }
 
     // Initialize defice FFT
-    DeviceFFT fft;
+    std::unique_ptr<DeviceFFT> fft = nullptr;
 
     std::string video_file = argv[1];
 
@@ -155,7 +238,9 @@ int main(int argc, char **argv)
 
     bool first                  = true;
     std::uint64_t total_samples = 0;
-    int n                       = 0;
+    size_t full_length          = 0;
+
+
     while (av_read_frame(format_context, packet) >= 0) {
         if (packet->stream_index == audio_stream_index) {
             int response = avcodec_send_packet(codec_context, packet);
@@ -179,6 +264,12 @@ int main(int argc, char **argv)
                     AVSampleFormat sample_fmt = static_cast<AVSampleFormat>(frame->format);
                     std::cout << "Sample format: " << av_get_sample_fmt_name(sample_fmt);
                     std::cout << " - " << (av_sample_fmt_is_planar(sample_fmt) ? "Planar" : "Non-Planar") << std::endl;
+
+                    // Determine full memory requirement
+                    full_length = format_context->streams[audio_stream_index]->nb_frames *
+                                  frame->nb_samples;
+                    std::cout << "Total: " << full_length << " samples across " << format_context->streams[audio_stream_index]->nb_frames << " frames" << std::endl;
+                    fft   = std::make_unique<DeviceFFT>(full_length, WINDOW_SIZE);
                     first = false;
                 }
 
@@ -197,19 +288,29 @@ int main(int argc, char **argv)
 
                 size_t data_size = av_get_bytes_per_sample(codec_context->sample_fmt) * frame->nb_samples;
 
-                std::cout << "Current: " << time_in_seconds << " - " << data_size << " bytes" << std::endl; // * frame->nb_samples * frame->channels;
-                n++;
-                fft.add_sample(reinterpret_cast<float *>(frame->data[0]), frame->nb_samples);
+                // std::cout << "Current: " << time_in_seconds << " - " << data_size << " bytes" << std::endl; // * frame->nb_samples * frame->channels;
+
+                fft->add_sample(reinterpret_cast<float *>(frame->data[0]), frame->nb_samples);
             }
-        }
-        if (n > 10) {
-            break;
         }
         av_packet_unref(packet);
     }
 
-
     avformat_close_input(&format_context);
+
+
+    // Now all data resides on the GPU. We can calculate the FFT
+    cufftResult result;
+
+    // Save the Hann window for visualization later
+
+    result = fft->run_batch_fft(full_length, WINDOW_SIZE, HOP_SIZE);
+    if (result != CUFFT_SUCCESS) {
+        return EXIT_FAILURE;
+    }
+
+    std::vector<float> window = fft->get_window_vector();
+    write_csv("window.csv", window);
 
 
     return EXIT_SUCCESS;
