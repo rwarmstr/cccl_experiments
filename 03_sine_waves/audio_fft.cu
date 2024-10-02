@@ -31,20 +31,27 @@ private:
 
     // Device-side buffers for FFT results and intermediate results
     thrust::device_vector<float> _fft_buf;
+    thrust::device_vector<float> _preprocess_buf;
     thrust::device_vector<float> _hann;
+    thrust::device_vector<float> _ones;
     thrust::device_vector<cufftComplex> _fft_results;
+    thrust::device_vector<float> _postprocess_buf;
 
-    // Host-side input buffer
     pinned_vector<float> _host_input_buf;
 
     // CUDA streams
     cudaStream_t _data_xfer_stream = 0;
     cudaStream_t _compute_stream   = 0;
+    cudaEvent_t _transfer_complete;
 
     // Other parameters
     size_t _window_size; // Size per FFT
     size_t _hop_size;    // Data offset between sample ranges
     size_t _batch_size;  // Number of batches to process simultaneously
+    size_t _last_batch_size = 0;
+
+
+    size_t _host_buf_pos = 0;
 
     int _sample_rate;
     int _freq_bin_end;
@@ -53,10 +60,15 @@ private:
     cufftHandle _plan;
 
 public:
-    DeviceFFT(size_t window_size, size_t hop_size, size_t batch_size, int sample_rate, int cutoff_freq)
-        : _fft_buf(batch_size * window_size),
+    // Host-side output buffer for FFT results
+    pinned_vector<float> _host_output_buf;
+
+    DeviceFFT(size_t window_size, size_t hop_size, size_t batch_size, size_t full_length, int sample_rate, int cutoff_freq)
+        : _fft_buf(batch_size * hop_size),
+          _preprocess_buf(batch_size * window_size),
           _hann(thrust::make_transform_iterator(thrust::counting_iterator<int>(0), hann_functor(window_size)),
                 thrust::make_transform_iterator(thrust::counting_iterator<int>(window_size), hann_functor(window_size))),
+          _ones(window_size, 1.0f),
           _host_input_buf(batch_size * hop_size),
           _hop_size(hop_size),
           _window_size(window_size),
@@ -68,9 +80,15 @@ public:
         cudaStreamCreateWithFlags(&_data_xfer_stream, cudaStreamNonBlocking);
         cudaStreamCreateWithFlags(&_compute_stream, cudaStreamNonBlocking);
 
+        cudaEventCreateWithFlags(&_transfer_complete, cudaEventDisableTiming);
+
         // Calculate the maximum frequency bin we care about given the sample rate
         float hz_per_bin = static_cast<float>(sample_rate) / window_size;
         _freq_bin_end    = static_cast<int>(std::ceil(cutoff_freq / hz_per_bin));
+
+        // Create an output buffer on the host to hold the results
+        _postprocess_buf.resize(_batch_size * _freq_bin_end);
+        _host_output_buf.resize((full_length / hop_size) * _freq_bin_end);
     }
 
     ~DeviceFFT()
@@ -78,6 +96,7 @@ public:
         NVTX3_FUNC_RANGE();
         cudaStreamDestroy(_data_xfer_stream);
         cudaStreamDestroy(_compute_stream);
+        cudaEventDestroy(_transfer_complete);
 
         cufftDestroy(_plan);
     }
@@ -98,11 +117,11 @@ public:
                                                          return cuda::std::abs(x);
                                                      });
 
-            cudaMalloc(&d_max, sizeof(float));
-            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, abs_it, d_max, _fft_buf.size());
-            cudaMalloc(&d_temp_storage, temp_storage_bytes);
-            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, abs_it, d_max, _fft_buf.size());
-            cudaFree(d_temp_storage);
+            cudaMallocAsync(&d_max, sizeof(float), _compute_stream);
+            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, abs_it, d_max, _fft_buf.size(), _compute_stream);
+            cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
+            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, abs_it, d_max, _fft_buf.size(), _compute_stream);
+            cudaFreeAsync(d_temp_storage, _compute_stream);
         }
 
         {
@@ -114,12 +133,12 @@ public:
 
             temp_storage_bytes = 0;
             d_temp_storage     = nullptr;
-            cub::DeviceFor::ForEach(d_temp_storage, temp_storage_bytes, _fft_buf.begin(), _fft_buf.end(), normalize_op);
-            cudaMalloc(&d_temp_storage, temp_storage_bytes);
-            cub::DeviceFor::ForEach(d_temp_storage, temp_storage_bytes, _fft_buf.begin(), _fft_buf.end(), normalize_op);
-            cudaFree(d_temp_storage);
+            cub::DeviceFor::ForEach(d_temp_storage, temp_storage_bytes, _fft_buf.begin(), _fft_buf.end(), normalize_op, _compute_stream);
+            cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
+            cub::DeviceFor::ForEach(d_temp_storage, temp_storage_bytes, _fft_buf.begin(), _fft_buf.end(), normalize_op, _compute_stream);
+            cudaFreeAsync(d_temp_storage, _compute_stream);
 
-            cudaFree(d_max);
+            cudaFreeAsync(d_max, _compute_stream);
         }
     }
 
@@ -137,6 +156,23 @@ public:
         }
     };
 
+    struct WindowTransformFunctor
+    {
+        float *in_buf_begin;
+        float *window_begin;
+        int batch_size;
+        int hop_size;
+        int chunk_size;
+
+        // Custom functor for the transformation
+        __device__ __host__ float operator()(int index) const
+        {
+            const int chunk_index = index / batch_size;
+            const int in_offset   = chunk_index * hop_size;
+            const int i           = index % chunk_size;
+            return in_buf_begin[in_offset + i] * window_begin[i];
+        }
+    };
 
     bool add_sample(float *data, int length, bool last)
     {
@@ -151,14 +187,18 @@ public:
         }
 
         if ((total_length == (_hop_size * _batch_size)) || last) {
-            nvtx3::scoped_range r("Copy and clear");
+            nvtx3::scoped_range r("Copy to device");
             cudaMemcpyAsync(thrust::raw_pointer_cast(_fft_buf.data()),
                             thrust::raw_pointer_cast(_host_input_buf.data()),
                             total_length * sizeof(float),
                             cudaMemcpyHostToDevice,
                             _data_xfer_stream);
-            // TODO: Remove
-            cudaStreamSynchronize(_data_xfer_stream);
+            // std::cout << "cudaEventQuery is " << cudaEventQuery(_transfer_complete) << std::endl;
+            cudaEventRecord(_transfer_complete, _data_xfer_stream);
+            // std::cout << "cudaEventQuery is " << cudaEventQuery(_transfer_complete) << std::endl;
+            if (last) {
+                _batch_size = total_length / _hop_size;
+            }
             total_length = 0;
             return true;
         }
@@ -174,91 +214,147 @@ public:
         return window;
     }
 
-    cufftResult run_batch_fft(int length, int window_size, int hop, bool normalize = true)
+    cufftResult run_batch_fft(bool normalize = true, bool window = true)
     {
         NVTX3_FUNC_RANGE();
         cufftResult result;
 
-        nvtxRangePushA("Ensure data transfer completion");
-        cudaStreamSynchronize(_data_xfer_stream);
-        nvtxRangePop();
-
-
-        int _num_batches = (length - window_size) / hop + 1;
         {
+            nvtx3::scoped_range r("Wait for data transfer");
+            // std::cout << "cudaEventQuery is " << cudaEventQuery(_transfer_complete) << std::endl;
+            //  cudaStreamWaitEvent(_compute_stream, _transfer_complete);
+            cudaEventSynchronize(_transfer_complete);
+            // std::cout << "-- cudaEventQuery is " << cudaEventQuery(_transfer_complete) << std::endl;
+        }
+        if (_batch_size != _last_batch_size) {
             nvtx3::scoped_range r("Allocate intermediate memory");
-            _fft_results.resize(_num_batches * window_size);
-            //_mags.resize(_num_batches * window_size);
+            _fft_results.resize(_batch_size * _window_size);
         }
 
         if (normalize) {
             normalize_values();
         }
 
-        // Create cuFFT plan
-        cufftHandle plan;
         {
+            nvtx3::scoped_range r("Transform input buffer");
+            float *window_ptr = thrust::raw_pointer_cast(_ones.data());
+            if (window) {
+                window_ptr = thrust::raw_pointer_cast(_hann.data());
+            }
+            WindowTransformFunctor f{thrust::raw_pointer_cast(_fft_buf.data()),
+                                     window_ptr,
+                                     static_cast<int>(_batch_size),
+                                     static_cast<int>(_hop_size),
+                                     static_cast<int>(_window_size)};
+            // Apply the transformation to each element in the input buffer
+            float *d_temp_storage     = nullptr;
+            size_t temp_storage_bytes = 0;
+
+            cub::CountingInputIterator<int> cnt(0);
+
+            cub::DeviceFor::ForEachN(d_temp_storage, temp_storage_bytes, cnt, _preprocess_buf.size(), f, _compute_stream);
+            cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
+            cub::DeviceFor::ForEachN(d_temp_storage, temp_storage_bytes, cnt, _preprocess_buf.size(), f, _compute_stream);
+            cudaFreeAsync(d_temp_storage, _compute_stream);
+        }
+        // Create cuFFT plan
+        if (_last_batch_size != _batch_size) {
             nvtx3::scoped_range plan_creation("Create FFT Plan");
-            int n[1]       = {window_size}; // FFT size is 4096
-            int inembed[1] = {length};      // Input size per batch
-            int istride    = 1;             // Stride between samples in a batch
-            int idist      = hop;           // Distance between the start of each batch (hop size)
-            int onembed[1] = {window_size}; // Output size per batch (same as input in 1D FFT)
+            int n[1]       = {static_cast<int>(_window_size)};               // FFT size is 4096
+            int inembed[1] = {static_cast<int>(_window_size * _batch_size)}; // Input size per batch
+            int istride    = 1;                                              // Stride between samples in a batch
+            int idist      = _window_size;                                   // Distance between the start of each batch (hop size)
+            int onembed[1] = {static_cast<int>(_window_size)};               // Output size per batch (same as input in 1D FFT)
             int ostride    = 1;
-            int odist      = window_size; // Distance between the start of each output batch
+            int odist      = _window_size; // Distance between the start of each output batch
 
             // Batch mode FFT plan creation
-            cufftPlanMany(&plan, 1, n, inembed, istride, idist, onembed, ostride, odist, CUFFT_R2C, _num_batches);
-            cufftSetStream(plan, _compute_stream);
+            cufftPlanMany(&_plan, 1, n, inembed, istride, idist, onembed, ostride, odist, CUFFT_R2C, _batch_size);
+            cufftSetStream(_plan, _compute_stream);
         }
 
         {
             nvtx3::scoped_range rng_exec("Execute");
-            result = cufftExecR2C(plan, _fft_buf.data().get(), _fft_results.data().get());
+            result = cufftExecR2C(_plan, _preprocess_buf.data().get(), _fft_results.data().get());
             if (result != CUFFT_SUCCESS) {
                 std::cout << "CUFFT Error: ExecR2C failed" << std::endl;
                 return result;
             }
         }
-
+        _last_batch_size = _batch_size;
+        this->magnitudes_to_host();
         return result;
     }
 
-    std::vector<float> get_magnitudes()
+    struct BinMagnitudeFunctor
+    {
+        cufftComplex *fft_results;
+        float *magnitudes;
+        int batch_size;
+        int bins_to_keep;
+
+        __device__ __host__ void operator()(int index) const
+        {
+            const int batch      = index / bins_to_keep;
+            const int i          = index % bins_to_keep;
+            const cufftComplex c = fft_results[batch * batch_size + i];
+            magnitudes[index]    = sqrtf(c.x * c.x + c.y * c.y);
+        }
+    };
+
+    void magnitudes_to_host()
     {
         NVTX3_FUNC_RANGE();
-        cudaStreamSynchronize(_compute_stream);
-
         {
-            nvtx3::scoped_range r("Convert bins to magnitude");
-            auto mag = thrust::transform_iterator(_fft_results.begin(),
-                                                  [this] __host__ __device__(cufftComplex c) {
-                                                      return sqrtf(c.x * c.x + c.y * c.y) / _window_size;
-                                                  });
+            nvtx3::scoped_range r("Convert bins to magnitude and trim");
 
-            // thrust::copy(mag, mag + _fft_results.size(), _mags.begin());
+            size_t total_items = _batch_size * _freq_bin_end;
+            cub::CountingInputIterator<int> counting_iterator(0);
+
+            size_t temp_storage_bytes = 0;
+            void *d_temp_storage      = nullptr;
+            cub::DeviceFor::ForEachN(d_temp_storage,
+                                     temp_storage_bytes,
+                                     counting_iterator,
+                                     total_items,
+                                     BinMagnitudeFunctor{_fft_results.data().get(),
+                                                         _postprocess_buf.data().get(),
+                                                         static_cast<int>(_batch_size),
+                                                         _freq_bin_end},
+                                     _compute_stream);
+            cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
+            cub::DeviceFor::ForEachN(d_temp_storage,
+                                     temp_storage_bytes,
+                                     counting_iterator,
+                                     total_items,
+                                     BinMagnitudeFunctor{_fft_results.data().get(),
+                                                         _postprocess_buf.data().get(),
+                                                         static_cast<int>(_batch_size),
+                                                         _freq_bin_end},
+                                     _compute_stream);
+            cudaFreeAsync(d_temp_storage, _compute_stream);
         }
 
-        nvtxRangePushA("Allocate host vector");
-        // std::vector<float> h_mags(_mags.size());
-        nvtxRangePop();
+        {
+            nvtx3::scoped_range r(("Fill output: " + std::to_string(_host_buf_pos) + " to " + std::to_string(_host_buf_pos + _last_batch_size * _freq_bin_end)));
 
-        nvtxRangePushA("Copy to Host");
-        // thrust::copy(_mags.begin(), _mags.end(), h_mags.begin());
-        nvtxRangePop();
-
-        return std::vector<float>(0);
+            cudaMemcpyAsync(thrust::raw_pointer_cast(_host_output_buf.data().get()) + _host_buf_pos,
+                            thrust::raw_pointer_cast(_postprocess_buf.data().get()),
+                            sizeof(float) * _batch_size * _freq_bin_end,
+                            cudaMemcpyDeviceToHost,
+                            _compute_stream);
+            _host_buf_pos += _last_batch_size * _freq_bin_end;
+        }
     }
 
+    size_t get_num_bins() const { return _freq_bin_end; }
+
+    /*
     std::vector<std::uint8_t> get_img_magnitudes()
     {
         NVTX3_FUNC_RANGE();
-        /*
-        cudaStreamSynchronize(_compute_stream);
-        nvtxRangePushA("Transform FFT results");
         {
             nvtx3::scoped_range r("Transform FFT results");
-
             auto mag = thrust::transform_iterator(_fft_results.begin(),
                                                   [this] __host__ __device__(cufftComplex c) {
                                                       return sqrtf(c.x * c.x + c.y * c.y) / _last_window_size;
@@ -300,8 +396,8 @@ public:
         cudaFree(d_max);
 
         return img;
-        */
     }
+    */
 };
 
 void write_csv(std::string filename, std::vector<float> &data)
@@ -422,7 +518,6 @@ int main(int argc, char **argv)
     size_t full_length = 0;
     size_t frame_count = 0;
 
-
     while (av_read_frame(format_context, packet) >= 0) {
         if (packet->stream_index == audio_stream_index) {
             int response = avcodec_send_packet(codec_context, packet);
@@ -451,14 +546,16 @@ int main(int argc, char **argv)
                     full_length = format_context->streams[audio_stream_index]->nb_frames *
                                   frame->nb_samples;
                     std::cout << "Total: " << full_length << " samples across " << format_context->streams[audio_stream_index]->nb_frames << " frames" << std::endl;
-                    fft   = std::make_unique<DeviceFFT>(WINDOW_SIZE, HOP_SIZE, 1024, frame->sample_rate, 5000);
+                    fft   = std::make_unique<DeviceFFT>(WINDOW_SIZE, HOP_SIZE, 1024, full_length, frame->sample_rate, 5000);
                     first = false;
                 }
 
                 size_t data_size = av_get_bytes_per_sample(codec_context->sample_fmt) * frame->nb_samples;
                 frame_count++;
                 bool last_frame = (frame_count == format_context->streams[audio_stream_index]->nb_frames) ? true : false;
-                fft->add_sample(reinterpret_cast<float *>(frame->data[0]), frame->nb_samples, last_frame);
+                if (fft->add_sample(reinterpret_cast<float *>(frame->data[0]), frame->nb_samples, last_frame)) {
+                    fft->run_batch_fft(true, true);
+                }
             }
         }
         av_packet_unref(packet);
@@ -466,48 +563,35 @@ int main(int argc, char **argv)
 
     avformat_close_input(&format_context);
 
+    // Wait for all threads to finish
+    cudaDeviceSynchronize();
 
-    // Now all data resides on the GPU. We can calculate the FFT
-    cufftResult result;
+    // write_csv("raw.csv", fft->_host_output_buf);
 
-    // Save the Hann window for visualization later
-
-    /*
-        result = fft->run_batch_fft(full_length, WINDOW_SIZE, HOP_SIZE);
-        if (result != CUFFT_SUCCESS) {
-            return EXIT_FAILURE;
+    std::ofstream outfile("raw.csv");
+    if (outfile.is_open()) {
+        std::ostringstream buffer;
+        for (const auto &val : fft->_host_output_buf) {
+            buffer << val << "\n";
         }
+        outfile << buffer.str();
+        outfile.close();
+    }
+    else {
+        std::cout << "Unable to open file" << std::endl;
+    }
 
+    {
+        nvtx3::scoped_range("Image Creation");
 
-        std::vector<float> float_mags = fft->get_magnitudes();
-        write_csv("video_mags.csv", float_mags);
+        cv::Mat image(full_length / HOP_SIZE, fft->get_num_bins(), CV_32F, fft->_host_output_buf.data().get());
+        cv::Mat normalized_image;
+        cv::normalize(image, normalized_image, 0, 255, cv::NORM_MINMAX, CV_32F);
 
-        std::vector<std::uint8_t> mags = fft->get_img_magnitudes();
+        cv::Mat grayscale;
+        normalized_image.convertTo(grayscale, CV_8U);
 
-        std::vector<float> window = fft->get_window_vector();
-        write_csv("window.csv", window);
-
-    */
-    /*
-        nvtxRangePushA("Image creation");
-
-        cv::Mat image(full_length / HOP_SIZE, WINDOW_SIZE, CV_8UC1, mags.data());
-        nvtxRangePushA("Crop");
-        cv::Mat cropped_image = image(cv::Rect(0, 0, 400, image.rows));
-        nvtxRangePop();
-        nvtxRangePushA("Transpose");
-        // cv::rotate(cropped_image, cropped_image, cv::ROTATE_90_COUNTERCLOCKWISE);
-        cv::Mat color_image;
-
-        // Apply a colormap. Options include COLORMAP_JET, COLORMAP_HOT, COLORMAP_COOL, etc.
-        // cv::applyColorMap(cropped_image, color_image, cv::COLORMAP_JET);
-        nvtxRangePop();
-
-        nvtxRangePushA("Write");
-
-        cv::imwrite("fft.png", cropped_image);
-        nvtxRangePop();
-        nvtxRangePop();
-    */
+        cv::imwrite("fft.png", grayscale);
+    }
     return EXIT_SUCCESS;
 }
