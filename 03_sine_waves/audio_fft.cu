@@ -64,12 +64,12 @@ public:
     pinned_vector<float> _host_output_buf;
 
     DeviceFFT(size_t window_size, size_t hop_size, size_t batch_size, size_t full_length, int sample_rate, int cutoff_freq)
-        : _fft_buf(batch_size * hop_size),
-          _preprocess_buf(batch_size * window_size),
+        : _fft_buf((batch_size + 1) * hop_size),
+          _preprocess_buf((batch_size + 1) * window_size),
           _hann(thrust::make_transform_iterator(thrust::counting_iterator<int>(0), hann_functor(window_size)),
                 thrust::make_transform_iterator(thrust::counting_iterator<int>(window_size), hann_functor(window_size))),
           _ones(window_size, 1.0f),
-          _host_input_buf(batch_size * hop_size),
+          _host_input_buf((batch_size + 1) * hop_size),
           _hop_size(hop_size),
           _window_size(window_size),
           _batch_size(batch_size),
@@ -87,7 +87,7 @@ public:
         _freq_bin_end    = static_cast<int>(std::ceil(cutoff_freq / hz_per_bin));
 
         // Create an output buffer on the host to hold the results
-        _postprocess_buf.resize(_batch_size * _freq_bin_end);
+        _postprocess_buf.resize((_batch_size + 1) * _freq_bin_end);
         _host_output_buf.resize((full_length / hop_size) * _freq_bin_end);
     }
 
@@ -158,19 +158,20 @@ public:
 
     struct WindowTransformFunctor
     {
-        float *in_buf_begin;
-        float *window_begin;
+        float *in_buf;
+        float *out_buf;
+        float *window;
         int batch_size;
         int hop_size;
-        int chunk_size;
+        int window_size;
 
         // Custom functor for the transformation
-        __device__ __host__ float operator()(int index) const
+        __device__ __host__ void operator()(int index) const
         {
             const int chunk_index = index / batch_size;
             const int in_offset   = chunk_index * hop_size;
-            const int i           = index % chunk_size;
-            return in_buf_begin[in_offset + i] * window_begin[i];
+            const int i           = index % window_size;
+            out_buf[index]        = in_buf[in_offset + i] * window[i];
         }
     };
 
@@ -242,6 +243,7 @@ public:
                 window_ptr = thrust::raw_pointer_cast(_hann.data());
             }
             WindowTransformFunctor f{thrust::raw_pointer_cast(_fft_buf.data()),
+                                     thrust::raw_pointer_cast(_preprocess_buf.data()),
                                      window_ptr,
                                      static_cast<int>(_batch_size),
                                      static_cast<int>(_hop_size),
@@ -269,7 +271,11 @@ public:
             int odist      = _window_size; // Distance between the start of each output batch
 
             // Batch mode FFT plan creation
-            cufftPlanMany(&_plan, 1, n, inembed, istride, idist, onembed, ostride, odist, CUFFT_R2C, _batch_size);
+            result = cufftPlanMany(&_plan, 1, n, inembed, istride, idist, onembed, ostride, odist, CUFFT_R2C, _batch_size);
+            if (result != CUFFT_SUCCESS) {
+                std::cout << "cuFFT error: Plan creation failed - " << result << std::endl;
+                return result;
+            }
             cufftSetStream(_plan, _compute_stream);
         }
 
@@ -277,7 +283,7 @@ public:
             nvtx3::scoped_range rng_exec("Execute");
             result = cufftExecR2C(_plan, _preprocess_buf.data().get(), _fft_results.data().get());
             if (result != CUFFT_SUCCESS) {
-                std::cout << "CUFFT Error: ExecR2C failed" << std::endl;
+                std::cout << "CUFFT Error: ExecR2C failed: " << result << std::endl;
                 return result;
             }
         }
@@ -290,14 +296,14 @@ public:
     {
         cufftComplex *fft_results;
         float *magnitudes;
-        int batch_size;
+        int window_size;
         int bins_to_keep;
 
         __device__ __host__ void operator()(int index) const
         {
             const int batch      = index / bins_to_keep;
             const int i          = index % bins_to_keep;
-            const cufftComplex c = fft_results[batch * batch_size + i];
+            const cufftComplex c = fft_results[batch * window_size + i];
             magnitudes[index]    = sqrtf(c.x * c.x + c.y * c.y);
         }
     };
@@ -319,7 +325,7 @@ public:
                                      total_items,
                                      BinMagnitudeFunctor{_fft_results.data().get(),
                                                          _postprocess_buf.data().get(),
-                                                         static_cast<int>(_batch_size),
+                                                         static_cast<int>(_window_size),
                                                          _freq_bin_end},
                                      _compute_stream);
             cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
@@ -329,7 +335,7 @@ public:
                                      total_items,
                                      BinMagnitudeFunctor{_fft_results.data().get(),
                                                          _postprocess_buf.data().get(),
-                                                         static_cast<int>(_batch_size),
+                                                         static_cast<int>(_window_size),
                                                          _freq_bin_end},
                                      _compute_stream);
             cudaFreeAsync(d_temp_storage, _compute_stream);
