@@ -18,7 +18,7 @@ extern "C"
 #include <libavutil/samplefmt.h>
 }
 
-#define WINDOW_SIZE (4096)
+#define WINDOW_SIZE (8192)
 #define HOP_SIZE (1024)
 
 
@@ -65,7 +65,7 @@ public:
 
     DeviceFFT(size_t window_size, size_t hop_size, size_t batch_size, size_t full_length, int sample_rate, int cutoff_freq)
         : _fft_buf(window_size + (batch_size - 1) * hop_size),
-          _preprocess_buf(_batch_size * _window_size),
+          _preprocess_buf(batch_size * window_size),
           _hann(thrust::make_transform_iterator(thrust::counting_iterator<int>(0), hann_functor(window_size)),
                 thrust::make_transform_iterator(thrust::counting_iterator<int>(window_size), hann_functor(window_size))),
           _ones(window_size, 1.0f),
@@ -263,7 +263,6 @@ public:
         // Create cuFFT plan
         if (_last_batch_size != _batch_size) {
             nvtx3::scoped_range plan_creation("Create FFT Plan");
-            std::cout << "Plan" << std::endl;
             /*
             int rank     = 1;                                // 1D transform
             int n[]      = {static_cast<int>(_window_size)}; // Size of each dimension
@@ -309,7 +308,8 @@ public:
         {
             const int batch      = index / bins_to_keep;
             const int i          = index % bins_to_keep;
-            const cufftComplex c = fft_results[batch * window_size + i];
+            const int step       = window_size / 2 + 1;
+            const cufftComplex c = fft_results[batch * step + i];
             magnitudes[index]    = sqrtf(c.x * c.x + c.y * c.y);
         }
     };
@@ -360,56 +360,6 @@ public:
     }
 
     size_t get_num_bins() const { return _freq_bin_end; }
-
-    /*
-    std::vector<std::uint8_t> get_img_magnitudes()
-    {
-        NVTX3_FUNC_RANGE();
-        {
-            nvtx3::scoped_range r("Transform FFT results");
-            auto mag = thrust::transform_iterator(_fft_results.begin(),
-                                                  [this] __host__ __device__(cufftComplex c) {
-                                                      return sqrtf(c.x * c.x + c.y * c.y) / _last_window_size;
-                                                  });
-
-            thrust::copy(mag, mag + _fft_results.size(), _mags.begin());
-        }
-
-        float *d_max              = nullptr;
-        void *d_temp_storage      = nullptr;
-        size_t temp_storage_bytes = 0;
-        {
-            nvtx3::scoped_range r("Find Maximum");
-
-            cudaMalloc(&d_max, sizeof(float));
-            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, _mags.data().get(), d_max, _mags.size());
-            cudaMalloc(&d_temp_storage, temp_storage_bytes);
-            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, _mags.data().get(), d_max, _mags.size());
-            cudaFree(d_temp_storage);
-        }
-
-        nvtxRangePushA("Convert to normalized uchar");
-        const int k        = 25;
-        auto img_transform = thrust::transform_iterator(_mags.begin(),
-                                                        [d_max, k] __host__ __device__(float x) {
-                                                            return (std::uint8_t)((logf(1 + (k * (x / *d_max))) / logf(1 + k)) * 255);
-                                                        });
-        thrust::device_vector<std::uint8_t> img_mags(img_transform, img_transform + _mags.size());
-        nvtxRangePop();
-
-        nvtxRangePushA("Allocate host memory");
-        std::vector<std::uint8_t> img(img_mags.size());
-        nvtxRangePop();
-
-        nvtxRangePushA("Copy to Host");
-        thrust::copy(img_mags.begin(), img_mags.end(), img.begin());
-        nvtxRangePop();
-
-        cudaFree(d_max);
-
-        return img;
-    }
-    */
 };
 
 void write_csv(std::string filename, std::vector<float> &data)
@@ -557,8 +507,9 @@ int main(int argc, char **argv)
                     // Determine full memory requirement
                     full_length = format_context->streams[audio_stream_index]->nb_frames *
                                   frame->nb_samples;
+                    std::cout << "Sample rate: " << frame->sample_rate << " kHz" << std::endl;
                     std::cout << "Total: " << full_length << " samples across " << format_context->streams[audio_stream_index]->nb_frames << " frames" << std::endl;
-                    fft   = std::make_unique<DeviceFFT>(WINDOW_SIZE, HOP_SIZE, 1024, full_length, frame->sample_rate, 5000);
+                    fft   = std::make_unique<DeviceFFT>(WINDOW_SIZE, HOP_SIZE, 1024, full_length, frame->sample_rate, 2000);
                     first = false;
                 }
 
@@ -602,8 +553,10 @@ int main(int argc, char **argv)
 
         cv::Mat grayscale;
         normalized_image.convertTo(grayscale, CV_8U);
+        cv::Mat colorized;
+        cv::applyColorMap(grayscale, colorized, cv::COLORMAP_JET);
 
-        cv::imwrite("fft.png", grayscale);
+        cv::imwrite("fft.png", colorized);
     }
     return EXIT_SUCCESS;
 }
