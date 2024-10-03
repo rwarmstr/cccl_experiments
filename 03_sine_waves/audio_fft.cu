@@ -64,12 +64,12 @@ public:
     pinned_vector<float> _host_output_buf;
 
     DeviceFFT(size_t window_size, size_t hop_size, size_t batch_size, size_t full_length, int sample_rate, int cutoff_freq)
-        : _fft_buf((batch_size + 1) * hop_size),
-          _preprocess_buf((batch_size + 1) * window_size),
+        : _fft_buf(window_size + (batch_size - 1) * hop_size),
+          _preprocess_buf(_batch_size * _window_size),
           _hann(thrust::make_transform_iterator(thrust::counting_iterator<int>(0), hann_functor(window_size)),
                 thrust::make_transform_iterator(thrust::counting_iterator<int>(window_size), hann_functor(window_size))),
           _ones(window_size, 1.0f),
-          _host_input_buf((batch_size + 1) * hop_size),
+          _host_input_buf(window_size + (batch_size - 1) * hop_size),
           _hop_size(hop_size),
           _window_size(window_size),
           _batch_size(batch_size),
@@ -168,7 +168,7 @@ public:
         // Custom functor for the transformation
         __device__ __host__ void operator()(int index) const
         {
-            const int chunk_index = index / batch_size;
+            const int chunk_index = index / window_size;
             const int in_offset   = chunk_index * hop_size;
             const int i           = index % window_size;
             out_buf[index]        = in_buf[in_offset + i] * window[i];
@@ -179,15 +179,16 @@ public:
     {
         NVTX3_FUNC_RANGE();
         static size_t total_length = 0;
+        const size_t buffer_length = _window_size + (_batch_size - 1) * _hop_size;
 
-        if (total_length + length <= _host_input_buf.capacity()) {
+        if (total_length + length <= buffer_length) {
             nvtx3::scoped_range r("Copy to bounce");
             std::copy(data, data + length, _host_input_buf.begin() + total_length);
             //_host_input_buf.insert(_host_input_buf.begin() + total_length, data, data + length);
             total_length += length;
         }
 
-        if ((total_length == (_hop_size * _batch_size)) || last) {
+        if ((total_length == buffer_length) || last) {
             nvtx3::scoped_range r("Copy to device");
             cudaMemcpyAsync(thrust::raw_pointer_cast(_fft_buf.data()),
                             thrust::raw_pointer_cast(_host_input_buf.data()),
@@ -254,24 +255,29 @@ public:
 
             cub::CountingInputIterator<int> cnt(0);
 
-            cub::DeviceFor::ForEachN(d_temp_storage, temp_storage_bytes, cnt, _preprocess_buf.size(), f, _compute_stream);
+            cub::DeviceFor::ForEachN(d_temp_storage, temp_storage_bytes, cnt, _window_size * _batch_size, f, _compute_stream);
             cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
-            cub::DeviceFor::ForEachN(d_temp_storage, temp_storage_bytes, cnt, _preprocess_buf.size(), f, _compute_stream);
+            cub::DeviceFor::ForEachN(d_temp_storage, temp_storage_bytes, cnt, _window_size * _batch_size, f, _compute_stream);
             cudaFreeAsync(d_temp_storage, _compute_stream);
         }
         // Create cuFFT plan
         if (_last_batch_size != _batch_size) {
             nvtx3::scoped_range plan_creation("Create FFT Plan");
-            int n[1]       = {static_cast<int>(_window_size)};               // FFT size is 4096
-            int inembed[1] = {static_cast<int>(_window_size * _batch_size)}; // Input size per batch
-            int istride    = 1;                                              // Stride between samples in a batch
-            int idist      = _window_size;                                   // Distance between the start of each batch (hop size)
-            int onembed[1] = {static_cast<int>(_window_size)};               // Output size per batch (same as input in 1D FFT)
-            int ostride    = 1;
-            int odist      = _window_size; // Distance between the start of each output batch
+            std::cout << "Plan" << std::endl;
+            /*
+            int rank     = 1;                                // 1D transform
+            int n[]      = {static_cast<int>(_window_size)}; // Size of each dimension
+            int *inembed = nullptr;                          // Embeddings, data is contiguous so NULL
+            int istride  = 1;                                // Input stride
+            int *onembed = nullptr;                          // Embeddings, data is contiguous so NULL
+            int ostride  = 1;                                // Output stride
+            int idist    = static_cast<int>(_window_size);
+            int odist    = static_cast<int>(_window_size / 2 + 1);
+            */
 
             // Batch mode FFT plan creation
-            result = cufftPlanMany(&_plan, 1, n, inembed, istride, idist, onembed, ostride, odist, CUFFT_R2C, _batch_size);
+            // result = cufftPlanMany(&_plan, rank, n, inembed, istride, idist, onembed, ostride, odist, CUFFT_R2C, _batch_size);
+            result = cufftPlan1d(&_plan, _window_size, CUFFT_R2C, _batch_size);
             if (result != CUFFT_SUCCESS) {
                 std::cout << "cuFFT error: Plan creation failed - " << result << std::endl;
                 return result;
