@@ -18,9 +18,10 @@ extern "C"
 #include <libavutil/samplefmt.h>
 }
 
-#define WINDOW_SIZE (8192)
+#define WINDOW_SIZE (16384)
 #define HOP_SIZE (1024)
-
+#define BATCH_SIZE (1024)
+#define FREQUENCY_CUTOFF (4200) // In Hz, piano C8 = 4186.01
 
 class DeviceFFT
 {
@@ -509,7 +510,7 @@ int main(int argc, char **argv)
                                   frame->nb_samples;
                     std::cout << "Sample rate: " << frame->sample_rate << " kHz" << std::endl;
                     std::cout << "Total: " << full_length << " samples across " << format_context->streams[audio_stream_index]->nb_frames << " frames" << std::endl;
-                    fft   = std::make_unique<DeviceFFT>(WINDOW_SIZE, HOP_SIZE, 1024, full_length, frame->sample_rate, 2000);
+                    fft   = std::make_unique<DeviceFFT>(WINDOW_SIZE, HOP_SIZE, BATCH_SIZE, full_length, frame->sample_rate, FREQUENCY_CUTOFF);
                     first = false;
                 }
 
