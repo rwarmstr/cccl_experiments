@@ -11,7 +11,7 @@
             "program": "${workspaceFolder}/build/03_sine_waves/audio_fft",
             "cwd": "${workspaceRoot}",
             "args": [
-                "~/video.mkv"
+                "~/video.mp4"
             ],
             "setupCommands": [
                 {
@@ -28,7 +28,7 @@
             "program": "${workspaceFolder}/build/03_sine_waves/audio_fft",
             "cwd": "${workspaceRoot}",
             "args": [
-                "~/video.mkv"
+                "~/video.mp4"
             ],
             "miDebuggerPath": "/usr/bin/gdb",
             "stopAtEntry": true,

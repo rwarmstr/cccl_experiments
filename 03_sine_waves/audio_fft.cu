@@ -18,8 +18,7 @@ extern "C"
 #include <libavutil/samplefmt.h>
 }
 
-#define WINDOW_SIZE (16384)
-#define HOP_SIZE (1024)
+#define WINDOW_SIZE (8192)
 #define BATCH_SIZE (1024)
 #define FREQUENCY_CUTOFF (4200) // In Hz, piano C8 = 4186.01
 
@@ -70,7 +69,7 @@ public:
           _hann(thrust::make_transform_iterator(thrust::counting_iterator<int>(0), hann_functor(window_size)),
                 thrust::make_transform_iterator(thrust::counting_iterator<int>(window_size), hann_functor(window_size))),
           _ones(window_size, 1.0f),
-          _host_input_buf(window_size + (batch_size - 1) * hop_size),
+          _host_input_buf(2 * window_size + (batch_size - 1) * hop_size),
           _hop_size(hop_size),
           _window_size(window_size),
           _batch_size(batch_size),
@@ -157,6 +156,59 @@ public:
         }
     };
 
+
+    bool add_sample(float *data, int length, bool last)
+    {
+        NVTX3_FUNC_RANGE();
+        static size_t total_length = 0;
+        const size_t buffer_length = _window_size + (_batch_size - 1) * _hop_size;
+
+        nvtx3::scoped_range r("Copy to bounce");
+        std::copy(data, data + length, _host_input_buf.begin() + total_length);
+        //_host_input_buf.insert(_host_input_buf.begin() + total_length, data, data + length);
+        total_length += length;
+
+
+        if ((total_length >= buffer_length) || last) {
+            nvtx3::scoped_range r("Copy to device");
+
+            cudaMemcpyAsync(thrust::raw_pointer_cast(_fft_buf.data()),
+                            thrust::raw_pointer_cast(_host_input_buf.data()),
+                            buffer_length * sizeof(float),
+                            cudaMemcpyHostToDevice,
+                            _data_xfer_stream);
+            if (last) {
+                _batch_size = total_length / _hop_size;
+            }
+            if (total_length > buffer_length) {
+                cudaMemcpyAsync(thrust::raw_pointer_cast(_host_input_buf.data()),
+                                thrust::raw_pointer_cast(_host_input_buf.data() + buffer_length),
+                                (total_length - buffer_length) * sizeof(float),
+                                cudaMemcpyHostToHost,
+                                _data_xfer_stream);
+                total_length -= buffer_length;
+            }
+            else {
+                total_length = 0;
+            }
+            // std::cout << "cudaEventQuery is " << cudaEventQuery(_transfer_complete) << std::endl;
+            cudaEventRecord(_transfer_complete, _data_xfer_stream);
+            // std::cout << "cudaEventQuery is " << cudaEventQuery(_transfer_complete) << std::endl;
+
+            return true;
+        }
+
+        return false;
+    }
+
+    std::vector<float> get_window_vector()
+    {
+        std::vector<float> window(_hann.size());
+        thrust::copy(_hann.begin(), _hann.end(), window.begin());
+
+        return window;
+    }
+
     struct WindowTransformFunctor
     {
         float *in_buf;
@@ -175,47 +227,6 @@ public:
             out_buf[index]        = in_buf[in_offset + i] * window[i];
         }
     };
-
-    bool add_sample(float *data, int length, bool last)
-    {
-        NVTX3_FUNC_RANGE();
-        static size_t total_length = 0;
-        const size_t buffer_length = _window_size + (_batch_size - 1) * _hop_size;
-
-        if (total_length + length <= buffer_length) {
-            nvtx3::scoped_range r("Copy to bounce");
-            std::copy(data, data + length, _host_input_buf.begin() + total_length);
-            //_host_input_buf.insert(_host_input_buf.begin() + total_length, data, data + length);
-            total_length += length;
-        }
-
-        if ((total_length == buffer_length) || last) {
-            nvtx3::scoped_range r("Copy to device");
-            cudaMemcpyAsync(thrust::raw_pointer_cast(_fft_buf.data()),
-                            thrust::raw_pointer_cast(_host_input_buf.data()),
-                            total_length * sizeof(float),
-                            cudaMemcpyHostToDevice,
-                            _data_xfer_stream);
-            // std::cout << "cudaEventQuery is " << cudaEventQuery(_transfer_complete) << std::endl;
-            cudaEventRecord(_transfer_complete, _data_xfer_stream);
-            // std::cout << "cudaEventQuery is " << cudaEventQuery(_transfer_complete) << std::endl;
-            if (last) {
-                _batch_size = total_length / _hop_size;
-            }
-            total_length = 0;
-            return true;
-        }
-
-        return false;
-    }
-
-    std::vector<float> get_window_vector()
-    {
-        std::vector<float> window(_hann.size());
-        thrust::copy(_hann.begin(), _hann.end(), window.begin());
-
-        return window;
-    }
 
     cufftResult run_batch_fft(bool normalize = true, bool window = true)
     {
@@ -264,19 +275,6 @@ public:
         // Create cuFFT plan
         if (_last_batch_size != _batch_size) {
             nvtx3::scoped_range plan_creation("Create FFT Plan");
-            /*
-            int rank     = 1;                                // 1D transform
-            int n[]      = {static_cast<int>(_window_size)}; // Size of each dimension
-            int *inembed = nullptr;                          // Embeddings, data is contiguous so NULL
-            int istride  = 1;                                // Input stride
-            int *onembed = nullptr;                          // Embeddings, data is contiguous so NULL
-            int ostride  = 1;                                // Output stride
-            int idist    = static_cast<int>(_window_size);
-            int odist    = static_cast<int>(_window_size / 2 + 1);
-            */
-
-            // Batch mode FFT plan creation
-            // result = cufftPlanMany(&_plan, rank, n, inembed, istride, idist, onembed, ostride, odist, CUFFT_R2C, _batch_size);
             result = cufftPlan1d(&_plan, _window_size, CUFFT_R2C, _batch_size);
             if (result != CUFFT_SUCCESS) {
                 std::cout << "cuFFT error: Plan creation failed - " << result << std::endl;
@@ -480,6 +478,7 @@ int main(int argc, char **argv)
     bool first         = true;
     size_t full_length = 0;
     size_t frame_count = 0;
+    int hop_size       = 0;
 
     while (av_read_frame(format_context, packet) >= 0) {
         if (packet->stream_index == audio_stream_index) {
@@ -510,8 +509,9 @@ int main(int argc, char **argv)
                                   frame->nb_samples;
                     std::cout << "Sample rate: " << frame->sample_rate << " kHz" << std::endl;
                     std::cout << "Total: " << full_length << " samples across " << format_context->streams[audio_stream_index]->nb_frames << " frames" << std::endl;
-                    fft   = std::make_unique<DeviceFFT>(WINDOW_SIZE, HOP_SIZE, BATCH_SIZE, full_length, frame->sample_rate, FREQUENCY_CUTOFF);
-                    first = false;
+                    hop_size = frame->sample_rate / 60;
+                    fft      = std::make_unique<DeviceFFT>(WINDOW_SIZE, hop_size, BATCH_SIZE, full_length, frame->sample_rate, FREQUENCY_CUTOFF);
+                    first    = false;
                 }
 
                 size_t data_size = av_get_bytes_per_sample(codec_context->sample_fmt) * frame->nb_samples;
@@ -548,7 +548,7 @@ int main(int argc, char **argv)
     {
         nvtx3::scoped_range("Image Creation");
 
-        cv::Mat image(full_length / HOP_SIZE, fft->get_num_bins(), CV_32F, fft->_host_output_buf.data().get());
+        cv::Mat image(full_length / hop_size, fft->get_num_bins(), CV_32F, fft->_host_output_buf.data().get());
         cv::Mat normalized_image;
         cv::normalize(image, normalized_image, 0, 255, cv::NORM_MINMAX, CV_32F);
 

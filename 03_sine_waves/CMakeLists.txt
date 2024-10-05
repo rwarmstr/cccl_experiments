@@ -10,6 +10,10 @@ target_link_libraries(signals
 
 set_target_properties(signals PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G")  # enable cuda-gdb (expensive)
+endif()
+
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(AVFORMAT REQUIRED libavformat)
