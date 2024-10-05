@@ -1,9 +1,20 @@
+#include "piano_scale_draw.h"
+
+#include <QApplication>
+#include <QProcessEnvironment>
+#include <QString>
 #include <cub/cub.cuh>
 #include <cufft.h>
 #include <fstream>
 #include <iostream>
 #include <nvtx3/nvToolsExt.h>
 #include <opencv2/opencv.hpp>
+#include <qwt_plot.h>
+#include <qwt_plot_curve.h>
+#include <qwt_plot_grid.h>
+#include <qwt_plot_renderer.h>
+#include <qwt_scale_draw.h>
+#include <qwt_scale_engine.h>
 #include <string>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
@@ -22,20 +33,20 @@ extern "C"
 #define BATCH_SIZE (1024)
 #define FREQUENCY_CUTOFF (4200) // In Hz, piano C8 = 4186.01
 
+// Template type for Thrust pinned host vector
+template <class T>
+using pinned_vector = thrust::host_vector<T, thrust::mr::stateless_resource_allocator<T, thrust::system::cuda::universal_host_pinned_memory_resource>>;
+
 class DeviceFFT
 {
 private:
-    // Template type for Thrust pinned host vector
-    template <class T>
-    using pinned_vector = thrust::host_vector<T, thrust::mr::stateless_resource_allocator<T, thrust::system::cuda::universal_host_pinned_memory_resource>>;
-
     // Device-side buffers for FFT results and intermediate results
     thrust::device_vector<float> _fft_buf;
     thrust::device_vector<float> _preprocess_buf;
     thrust::device_vector<float> _hann;
     thrust::device_vector<float> _ones;
     thrust::device_vector<cufftComplex> _fft_results;
-    thrust::device_vector<float> _postprocess_buf;
+    thrust::device_vector<double> _postprocess_buf;
 
     pinned_vector<float> _host_input_buf;
 
@@ -49,6 +60,8 @@ private:
     size_t _hop_size;    // Data offset between sample ranges
     size_t _batch_size;  // Number of batches to process simultaneously
     size_t _last_batch_size = 0;
+    float _hz_per_bin       = 0.0f;
+    double output_max       = 0.0;
 
 
     size_t _host_buf_pos = 0;
@@ -61,7 +74,7 @@ private:
 
 public:
     // Host-side output buffer for FFT results
-    pinned_vector<float> _host_output_buf;
+    pinned_vector<double> _host_output_buf;
 
     DeviceFFT(size_t window_size, size_t hop_size, size_t batch_size, size_t full_length, int sample_rate, int cutoff_freq)
         : _fft_buf(window_size + (batch_size - 1) * hop_size),
@@ -83,8 +96,8 @@ public:
         cudaEventCreateWithFlags(&_transfer_complete, cudaEventDisableTiming);
 
         // Calculate the maximum frequency bin we care about given the sample rate
-        float hz_per_bin = static_cast<float>(sample_rate) / window_size;
-        _freq_bin_end    = static_cast<int>(std::ceil(cutoff_freq / hz_per_bin));
+        _hz_per_bin   = static_cast<float>(sample_rate) / window_size;
+        _freq_bin_end = static_cast<int>(std::ceil(cutoff_freq / _hz_per_bin));
 
         // Create an output buffer on the host to hold the results
         _postprocess_buf.resize((_batch_size + 1) * _freq_bin_end);
@@ -299,7 +312,7 @@ public:
     struct BinMagnitudeFunctor
     {
         cufftComplex *fft_results;
-        float *magnitudes;
+        double *magnitudes;
         int window_size;
         int bins_to_keep;
 
@@ -309,7 +322,7 @@ public:
             const int i          = index % bins_to_keep;
             const int step       = window_size / 2 + 1;
             const cufftComplex c = fft_results[batch * step + i];
-            magnitudes[index]    = sqrtf(c.x * c.x + c.y * c.y);
+            magnitudes[index]    = sqrt(c.x * c.x + c.y * c.y);
         }
     };
 
@@ -347,18 +360,26 @@ public:
         }
 
         {
+            nvtx3::scoped_range r("Find max output magnitude");
+        }
+
+        {
             nvtx3::scoped_range r(("Fill output: " + std::to_string(_host_buf_pos) + " to " + std::to_string(_host_buf_pos + _last_batch_size * _freq_bin_end)));
 
             cudaMemcpyAsync(thrust::raw_pointer_cast(_host_output_buf.data().get()) + _host_buf_pos,
                             thrust::raw_pointer_cast(_postprocess_buf.data().get()),
-                            sizeof(float) * _batch_size * _freq_bin_end,
+                            sizeof(double) * _batch_size * _freq_bin_end,
                             cudaMemcpyDeviceToHost,
-                            _compute_stream);
+                            _data_xfer_stream);
             _host_buf_pos += _last_batch_size * _freq_bin_end;
         }
     }
 
     size_t get_num_bins() const { return _freq_bin_end; }
+    size_t get_sample_rate() const { return _sample_rate; }
+    size_t get_window_size() const { return _window_size; }
+    float get_hz_per_bin() const { return _hz_per_bin; }
+    size_t get_hop_size() const { return _hop_size; }
 };
 
 void write_csv(std::string filename, std::vector<float> &data)
@@ -378,12 +399,102 @@ void write_csv(std::string filename, std::vector<float> &data)
     }
 }
 
+int draw_spectrogram(const std::string &filename, const std::unique_ptr<DeviceFFT> &fft)
+{
+    int num_bins = fft->get_num_bins();
+
+    std::vector<double> frequencies(num_bins);
+    for (int i = 0; i < frequencies.size(); i++) {
+        frequencies[i] = i * fft->get_hz_per_bin();
+    }
+
+    double max = 0.0;
+    max        = std::max(max, *std::max_element(fft->_host_output_buf.begin(), fft->_host_output_buf.end()));
+
+    nvtxRangePushA("Set up plot");
+    // Create the plot
+    QwtPlot plot;
+    plot.setCanvasBackground(Qt::white);
+    plot.setTitle("Frequency");
+    plot.setAxisTitle(QwtPlot::xBottom, "Frequency (Hz)");
+    plot.setAxisTitle(QwtPlot::yLeft, "Magnitude");
+    plot.setAxisScaleEngine(QwtPlot::xBottom, new QwtLogScaleEngine());
+
+    QwtScaleDiv scale(27.0, 4200.0, QList<double>(), QList<double>(), notes);
+    plot.setAxisScale(QwtPlot::xBottom, 27, 4200); // Frequency range
+    plot.setAxisScaleDiv(QwtPlot::xBottom, scale);
+    plot.setAxisScaleDraw(QwtPlot::xBottom, new PianoScaleDraw());
+    plot.setAxisScale(QwtPlot::yLeft, 0, max);
+    plot.setFixedSize(1920, 1080);
+
+    std::unique_ptr<QwtPlotGrid> grid = std::make_unique<QwtPlotGrid>();
+
+    // Step 2: Customize the grid
+    // Set the pen for the major grid lines (solid line, black color)
+    grid->setMajorPen(QPen(Qt::gray, 0, Qt::DashLine));
+
+    // Set the pen for the minor grid lines (dotted line, gray color)
+    grid->setMinorPen(QPen(Qt::gray, 0, Qt::DashLine));
+
+    // Step 3: Attach the grid to the plot
+    grid->attach(&plot);
+
+    std::unique_ptr<QwtPlotCurve> curve = std::make_unique<QwtPlotCurve>();
+    curve->setPen(QPen(Qt::blue, 3, Qt::SolidLine));
+    curve->attach(&plot);
+
+    QwtPlotRenderer renderer;
+    renderer.setDiscardFlag(QwtPlotRenderer::DiscardBackground, false);
+    nvtxRangePop();
+
+    nvtxRangePushA("Initialize video writer");
+    cv::VideoWriter video(filename,
+                          cv::VideoWriter::fourcc('a', 'v', 'c', '1'),
+                          (double)fft->get_sample_rate() / (double)fft->get_hop_size(),
+                          cv::Size(1920, 1080));
+    if (!video.isOpened()) {
+        std::cerr << "Could not open the video writer" << std::endl;
+        return EXIT_FAILURE;
+    }
+    nvtxRangePop();
+
+    for (int frame = 0; frame < fft->_host_output_buf.size() / num_bins; ++frame) {
+        nvtx3::scoped_range r("Process frame " + std::to_string(frame));
+        if (frame % 100 == 0) {
+            std::cout << "Processing frame: " << frame << "/" << fft->_host_output_buf.size() / num_bins << std::endl;
+        }
+
+        curve->setSamples(frequencies.data(), static_cast<double *>(thrust::raw_pointer_cast(fft->_host_output_buf.data())) + frame * num_bins, num_bins);
+
+        plot.replot();
+        QPixmap pixmap(plot.size());
+        QPainter painter(&pixmap);
+
+        renderer.render(&plot, &painter, plot.geometry());
+        QImage image = pixmap.toImage();
+
+        {
+            nvtx3::scoped_range r2("Write mat to video");
+            cv::Mat mat(image.height(), image.width(), CV_8UC4, const_cast<uchar *>(image.bits()), image.bytesPerLine());
+            cv::Mat bgr_mat;
+            cv::cvtColor(mat, bgr_mat, cv::COLOR_BGRA2BGR);
+            video.write(bgr_mat);
+        }
+    }
+
+    return EXIT_SUCCESS;
+}
+
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " <input_file>" << std::endl;
         return EXIT_FAILURE;
     }
+
+    qputenv("QT_QPA_PLATFORM", QByteArray("offscreen"));
+    QApplication app(argc, argv);
 
     // Initialize defice FFT
     std::unique_ptr<DeviceFFT> fft = nullptr;
@@ -480,6 +591,8 @@ int main(int argc, char **argv)
     size_t frame_count = 0;
     int hop_size       = 0;
 
+    int num_frames = format_context->streams[audio_stream_index]->nb_frames;
+
     while (av_read_frame(format_context, packet) >= 0) {
         if (packet->stream_index == audio_stream_index) {
             int response = avcodec_send_packet(codec_context, packet);
@@ -516,7 +629,7 @@ int main(int argc, char **argv)
 
                 size_t data_size = av_get_bytes_per_sample(codec_context->sample_fmt) * frame->nb_samples;
                 frame_count++;
-                bool last_frame = (frame_count == format_context->streams[audio_stream_index]->nb_frames) ? true : false;
+                bool last_frame = (frame_count == (num_frames - 1)) ? true : false;
                 if (fft->add_sample(reinterpret_cast<float *>(frame->data[0]), frame->nb_samples, last_frame)) {
                     fft->run_batch_fft(true, true);
                 }
@@ -532,6 +645,10 @@ int main(int argc, char **argv)
 
     // write_csv("raw.csv", fft->_host_output_buf);
 
+    draw_spectrogram("animation.mp4", fft);
+
+    // Uncomment below to save raw values to file for external processing
+    /*
     std::ofstream outfile("raw.csv");
     if (outfile.is_open()) {
         std::ostringstream buffer;
@@ -544,7 +661,9 @@ int main(int argc, char **argv)
     else {
         std::cout << "Unable to open file" << std::endl;
     }
+    */
 
+    // Uncomment below to save the entire spectrogram as a PNG image
     {
         nvtx3::scoped_range("Image Creation");
 
