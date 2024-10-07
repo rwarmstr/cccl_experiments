@@ -60,6 +60,7 @@ private:
     thrust::device_vector<float> _ones;
     thrust::device_vector<cufftComplex> _fft_results;
     thrust::device_vector<double> _postprocess_buf;
+    thrust::device_vector<double> _chunk_max_buf;
 
     pinned_vector<float> _host_input_buf;
 
@@ -80,6 +81,7 @@ private:
 
 
     size_t _host_buf_pos = 0;
+    size_t _chunk_count  = 0;
 
     int _sample_rate;
     int _freq_bin_end;
@@ -102,7 +104,6 @@ public:
           _window_size(window_size),
           _batch_size(batch_size),
           _sample_rate(sample_rate)
-
     {
         NVTX3_FUNC_RANGE();
         cudaStreamCreateWithFlags(&_data_xfer_stream, cudaStreamNonBlocking);
@@ -118,6 +119,11 @@ public:
         // Create an output buffer on the host to hold the results
         _postprocess_buf.resize((_batch_size + 1) * _freq_bin_end);
         _host_output_buf.resize((full_length / hop_size) * _freq_bin_end);
+
+        // Allocate intermediate space for max chunks
+        size_t chunk_size      = (_window_size + (_batch_size - 1) * _hop_size);
+        size_t expected_chunks = (full_length + chunk_size - 1) / chunk_size;
+        _chunk_max_buf.resize(expected_chunks);
 
         cudaMalloc(&_d_output_max, sizeof(double));
         cudaMallocHost(&_h_output_max, sizeof(double));
@@ -386,12 +392,11 @@ public:
                 cub::DeviceReduce::Max(d_temp_storage,
                                        temp_storage_bytes,
                                        _postprocess_buf.data().get(),
-                                       _d_output_max,
+                                       _chunk_max_buf.data().get() + _chunk_count,
                                        _postprocess_buf.size(),
                                        _compute_stream);
             });
-
-            cudaMemcpyAsync(_h_output_max, _d_output_max, sizeof(double), cudaMemcpyDeviceToHost, _compute_stream);
+            _chunk_count++;
         }
 
         {
@@ -411,7 +416,20 @@ public:
     size_t get_window_size() const { return _window_size; }
     float get_hz_per_bin() const { return _hz_per_bin; }
     size_t get_hop_size() const { return _hop_size; }
-    double get_output_max() const { return *_h_output_max; }
+    double get_output_max() const
+    {
+        cub_helper(_compute_stream, [&](void *d_temp_storage, size_t &temp_storage_bytes) {
+            cub::DeviceReduce::Max(d_temp_storage,
+                                   temp_storage_bytes,
+                                   _chunk_max_buf.data().get(),
+                                   _d_output_max,
+                                   _chunk_count,
+                                   _compute_stream);
+        });
+        cudaMemcpyAsync(_h_output_max, _d_output_max, sizeof(double), cudaMemcpyDeviceToHost, _compute_stream);
+        cudaStreamSynchronize(_compute_stream);
+        return *_h_output_max;
+    }
 
     void synchronize()
     {
