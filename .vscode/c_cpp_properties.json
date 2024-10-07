@@ -6,7 +6,8 @@
                 "${workspaceFolder}/**",
                 "/usr/local/cuda/include",
                 "/usr/include/x86_64-linux-gnu/qt5/**",
-                "/usr/include/qwt"
+                "/usr/include/qwt",
+                "/usr/include/opencv4"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
