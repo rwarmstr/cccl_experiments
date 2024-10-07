@@ -513,27 +513,33 @@ int draw_spectrogram(const std::string &filename, const std::unique_ptr<DeviceFF
     }
     nvtxRangePop();
 
+    QPixmap pixmap(plot.size());
+    QPainter painter(&pixmap);
+    QImage image = pixmap.toImage();
+    cv::Mat mat(image.height(), image.width(), CV_8UC4);
+    cv::Mat bgr_mat;
+
     for (int frame = 0; frame < fft->_host_output_buf.size() / num_bins; ++frame) {
         nvtx3::scoped_range r("Process frame " + std::to_string(frame));
         if (frame % 100 == 0) {
             std::cout << "Processing frame: " << frame << "/" << fft->_host_output_buf.size() / num_bins << std::endl;
         }
 
-        curve->setSamples(frequencies.data(), static_cast<double *>(thrust::raw_pointer_cast(fft->_host_output_buf.data())) + frame * num_bins, num_bins);
+        // Set samples for the curve (this may involve allocations depending on curve implementation)
+        curve->setSamples(frequencies.data(),
+                          static_cast<double *>(thrust::raw_pointer_cast(fft->_host_output_buf.data())) + frame * num_bins,
+                          num_bins);
 
+        // Render plot without recreating pixmap, painter, or QImage
         plot.replot();
-        QPixmap pixmap(plot.size());
-        QPainter painter(&pixmap);
-
         renderer.render(&plot, &painter, plot.geometry());
-        QImage image = pixmap.toImage();
+        image = pixmap.toImage(); // Reset the image without reallocating pixmap
 
         {
             nvtx3::scoped_range r2("Write mat to video");
-            cv::Mat mat(image.height(), image.width(), CV_8UC4, const_cast<uchar *>(image.bits()), image.bytesPerLine());
-            cv::Mat bgr_mat;
-            cv::cvtColor(mat, bgr_mat, cv::COLOR_BGRA2BGR);
-            video.write(bgr_mat);
+            mat = cv::Mat(image.height(), image.width(), CV_8UC4, const_cast<uchar *>(image.bits()), image.bytesPerLine());
+            cv::cvtColor(mat, bgr_mat, cv::COLOR_BGRA2BGR); // Reuse bgr_mat
+            video.write(bgr_mat);                           // Write the frame to the video
         }
     }
 
