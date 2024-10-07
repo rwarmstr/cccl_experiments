@@ -61,7 +61,8 @@ private:
     size_t _batch_size;  // Number of batches to process simultaneously
     size_t _last_batch_size = 0;
     float _hz_per_bin       = 0.0f;
-    double output_max       = 0.0;
+    double *_d_output_max   = nullptr;
+    double _h_output_max    = 0.0f;
 
 
     size_t _host_buf_pos = 0;
@@ -102,6 +103,8 @@ public:
         // Create an output buffer on the host to hold the results
         _postprocess_buf.resize((_batch_size + 1) * _freq_bin_end);
         _host_output_buf.resize((full_length / hop_size) * _freq_bin_end);
+
+        cudaMalloc(&_d_output_max, sizeof(double));
     }
 
     ~DeviceFFT()
@@ -110,6 +113,8 @@ public:
         cudaStreamDestroy(_data_xfer_stream);
         cudaStreamDestroy(_compute_stream);
         cudaEventDestroy(_transfer_complete);
+
+        cudaFree(&_d_output_max);
 
         cufftDestroy(_plan);
     }
@@ -361,6 +366,13 @@ public:
 
         {
             nvtx3::scoped_range r("Find max output magnitude");
+            size_t temp_storage_bytes = 0;
+            void *d_temp_storage      = nullptr;
+            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, _postprocess_buf.data().get(), _d_output_max, _postprocess_buf.size(), _compute_stream);
+            cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
+            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, _postprocess_buf.data().get(), _d_output_max, _postprocess_buf.size(), _compute_stream);
+            cudaFreeAsync(d_temp_storage, _compute_stream);
+            cudaMemcpyAsync(&_h_output_max, _d_output_max, sizeof(double), cudaMemcpyDeviceToHost, _compute_stream);
         }
 
         {
@@ -380,6 +392,13 @@ public:
     size_t get_window_size() const { return _window_size; }
     float get_hz_per_bin() const { return _hz_per_bin; }
     size_t get_hop_size() const { return _hop_size; }
+    double get_output_max() const { return _h_output_max; }
+
+    void synchronize()
+    {
+        cudaStreamSynchronize(_compute_stream);
+        cudaStreamSynchronize(_data_xfer_stream);
+    }
 };
 
 void write_csv(std::string filename, std::vector<float> &data)
@@ -408,8 +427,7 @@ int draw_spectrogram(const std::string &filename, const std::unique_ptr<DeviceFF
         frequencies[i] = i * fft->get_hz_per_bin();
     }
 
-    double max = 0.0;
-    max        = std::max(max, *std::max_element(fft->_host_output_buf.begin(), fft->_host_output_buf.end()));
+    double max = fft->get_output_max();
 
     nvtxRangePushA("Set up plot");
     // Create the plot
@@ -641,7 +659,7 @@ int main(int argc, char **argv)
     avformat_close_input(&format_context);
 
     // Wait for all threads to finish
-    cudaDeviceSynchronize();
+    fft->synchronize();
 
     // write_csv("raw.csv", fft->_host_output_buf);
 

@@ -33,6 +33,7 @@ set(FFMPEG_LIBS
     ${AVUTIL_LIBRARIES}
 )
 
+find_package(Qt5 COMPONENTS Core Gui Widgets REQUIRED)
 find_package( OpenCV REQUIRED )
 include_directories( ${OpenCV_INCLUDE_DIRS} )
 
@@ -40,13 +41,19 @@ add_executable(audio_fft
     audio_fft.cu
 )
 
-target_include_directories(audio_fft PRIVATE
+target_include_directories(audio_fft PUBLIC
+    /usr/include/qwt
+    ${OpenCV_INCLUDE_DIRS}
     ${AVFORMAT_INCLUDE_DIRS}
     ${AVCODEC_INCLUDE_DIRS}
     ${AVUTIL_INCLUDE_DIRS}
 )
 
 target_link_libraries(audio_fft
+    Qt5::Core 
+    Qt5::Gui 
+    Qt5::Widgets 
+    /usr/lib/libqwt-qt5.so
     CUDA::cufft
     ${FFMPEG_LIBS}
     ${OpenCV_LIBS}
