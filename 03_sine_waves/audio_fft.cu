@@ -37,6 +37,19 @@ extern "C"
 template <class T>
 using pinned_vector = thrust::host_vector<T, thrust::mr::stateless_resource_allocator<T, thrust::system::cuda::universal_host_pinned_memory_resource>>;
 
+template <typename CubFunction>
+void cub_helper(cudaStream_t stream, CubFunction cub_function)
+{
+    void *d_temp_storage      = nullptr;
+    size_t temp_storage_bytes = 0;
+
+    // CUB "double call" idiom with temporary storage allocation
+    cub_function(d_temp_storage, temp_storage_bytes);
+    cudaMallocAsync(&d_temp_storage, temp_storage_bytes, stream);
+    cub_function(d_temp_storage, temp_storage_bytes);
+    cudaFreeAsync(d_temp_storage, stream);
+}
+
 class DeviceFFT
 {
 private:
@@ -54,6 +67,7 @@ private:
     cudaStream_t _data_xfer_stream = 0;
     cudaStream_t _compute_stream   = 0;
     cudaEvent_t _transfer_complete;
+    cudaEvent_t _compute_complete;
 
     // Other parameters
     size_t _window_size; // Size per FFT
@@ -62,7 +76,7 @@ private:
     size_t _last_batch_size = 0;
     float _hz_per_bin       = 0.0f;
     double *_d_output_max   = nullptr;
-    double _h_output_max    = 0.0f;
+    double *_h_output_max   = nullptr;
 
 
     size_t _host_buf_pos = 0;
@@ -95,6 +109,7 @@ public:
         cudaStreamCreateWithFlags(&_compute_stream, cudaStreamNonBlocking);
 
         cudaEventCreateWithFlags(&_transfer_complete, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&_compute_complete, cudaEventDisableTiming);
 
         // Calculate the maximum frequency bin we care about given the sample rate
         _hz_per_bin   = static_cast<float>(sample_rate) / window_size;
@@ -105,6 +120,7 @@ public:
         _host_output_buf.resize((full_length / hop_size) * _freq_bin_end);
 
         cudaMalloc(&_d_output_max, sizeof(double));
+        cudaMallocHost(&_h_output_max, sizeof(double));
     }
 
     ~DeviceFFT()
@@ -113,8 +129,10 @@ public:
         cudaStreamDestroy(_data_xfer_stream);
         cudaStreamDestroy(_compute_stream);
         cudaEventDestroy(_transfer_complete);
+        cudaEventDestroy(_compute_complete);
 
-        cudaFree(&_d_output_max);
+        cudaFree(_d_output_max);
+        cudaFreeHost(_h_output_max);
 
         cufftDestroy(_plan);
     }
@@ -124,10 +142,7 @@ public:
     {
         NVTX3_FUNC_RANGE();
 
-        float *d_max              = nullptr;
-        void *d_temp_storage      = nullptr;
-        size_t temp_storage_bytes = 0;
-
+        float *d_max = nullptr;
         {
             nvtx3::scoped_range find_max("Find max");
             auto abs_it = thrust::transform_iterator(_fft_buf.begin(),
@@ -135,11 +150,18 @@ public:
                                                          return cuda::std::abs(x);
                                                      });
 
+
             cudaMallocAsync(&d_max, sizeof(float), _compute_stream);
-            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, abs_it, d_max, _fft_buf.size(), _compute_stream);
-            cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
-            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, abs_it, d_max, _fft_buf.size(), _compute_stream);
-            cudaFreeAsync(d_temp_storage, _compute_stream);
+            cub_helper(_compute_stream, [&](void *d_temp_storage, size_t &temp_storage_bytes) {
+                cub::DeviceReduce::Max(
+                    d_temp_storage,
+                    temp_storage_bytes,
+                    abs_it,          // Input iterator
+                    d_max,           // Output pointer
+                    _fft_buf.size(), // Number of items
+                    _compute_stream  // CUDA stream
+                );
+            });
         }
 
         {
@@ -149,13 +171,16 @@ public:
                 x = x / *d_max;
             };
 
-            temp_storage_bytes = 0;
-            d_temp_storage     = nullptr;
-            cub::DeviceFor::ForEach(d_temp_storage, temp_storage_bytes, _fft_buf.begin(), _fft_buf.end(), normalize_op, _compute_stream);
-            cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
-            cub::DeviceFor::ForEach(d_temp_storage, temp_storage_bytes, _fft_buf.begin(), _fft_buf.end(), normalize_op, _compute_stream);
-            cudaFreeAsync(d_temp_storage, _compute_stream);
-
+            cub_helper(_compute_stream, [&](void *d_temp_storage, size_t &temp_storage_bytes) {
+                cub::DeviceFor::ForEach(
+                    d_temp_storage,
+                    temp_storage_bytes,
+                    _fft_buf.begin(), // Range begin
+                    _fft_buf.end(),   // Range end
+                    normalize_op,     // Operator
+                    _compute_stream   // CUDA stream
+                );
+            });
             cudaFreeAsync(d_max, _compute_stream);
         }
     }
@@ -280,15 +305,16 @@ public:
                                      static_cast<int>(_hop_size),
                                      static_cast<int>(_window_size)};
             // Apply the transformation to each element in the input buffer
-            float *d_temp_storage     = nullptr;
-            size_t temp_storage_bytes = 0;
-
             cub::CountingInputIterator<int> cnt(0);
 
-            cub::DeviceFor::ForEachN(d_temp_storage, temp_storage_bytes, cnt, _window_size * _batch_size, f, _compute_stream);
-            cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
-            cub::DeviceFor::ForEachN(d_temp_storage, temp_storage_bytes, cnt, _window_size * _batch_size, f, _compute_stream);
-            cudaFreeAsync(d_temp_storage, _compute_stream);
+            cub_helper(_compute_stream, [&](void *d_temp_storage, size_t &temp_storage_bytes) {
+                cub::DeviceFor::ForEachN(d_temp_storage,
+                                         temp_storage_bytes,
+                                         cnt,
+                                         _window_size * _batch_size,
+                                         f,
+                                         _compute_stream);
+            });
         }
         // Create cuFFT plan
         if (_last_batch_size != _batch_size) {
@@ -340,44 +366,37 @@ public:
             size_t total_items = _batch_size * _freq_bin_end;
             cub::CountingInputIterator<int> counting_iterator(0);
 
-            size_t temp_storage_bytes = 0;
-            void *d_temp_storage      = nullptr;
-            cub::DeviceFor::ForEachN(d_temp_storage,
-                                     temp_storage_bytes,
-                                     counting_iterator,
-                                     total_items,
-                                     BinMagnitudeFunctor{_fft_results.data().get(),
-                                                         _postprocess_buf.data().get(),
-                                                         static_cast<int>(_window_size),
-                                                         _freq_bin_end},
-                                     _compute_stream);
-            cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
-            cub::DeviceFor::ForEachN(d_temp_storage,
-                                     temp_storage_bytes,
-                                     counting_iterator,
-                                     total_items,
-                                     BinMagnitudeFunctor{_fft_results.data().get(),
-                                                         _postprocess_buf.data().get(),
-                                                         static_cast<int>(_window_size),
-                                                         _freq_bin_end},
-                                     _compute_stream);
-            cudaFreeAsync(d_temp_storage, _compute_stream);
+            cub_helper(_compute_stream, [&](void *d_temp_storage, size_t &temp_storage_bytes) {
+                cub::DeviceFor::ForEachN(d_temp_storage,
+                                         temp_storage_bytes,
+                                         counting_iterator,
+                                         total_items,
+                                         BinMagnitudeFunctor{_fft_results.data().get(),
+                                                             _postprocess_buf.data().get(),
+                                                             static_cast<int>(_window_size),
+                                                             _freq_bin_end},
+                                         _compute_stream);
+            });
+            cudaEventRecord(_compute_complete, _compute_stream);
         }
 
         {
             nvtx3::scoped_range r("Find max output magnitude");
-            size_t temp_storage_bytes = 0;
-            void *d_temp_storage      = nullptr;
-            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, _postprocess_buf.data().get(), _d_output_max, _postprocess_buf.size(), _compute_stream);
-            cudaMallocAsync(&d_temp_storage, temp_storage_bytes, _compute_stream);
-            cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, _postprocess_buf.data().get(), _d_output_max, _postprocess_buf.size(), _compute_stream);
-            cudaFreeAsync(d_temp_storage, _compute_stream);
-            cudaMemcpyAsync(&_h_output_max, _d_output_max, sizeof(double), cudaMemcpyDeviceToHost, _compute_stream);
+            cub_helper(_compute_stream, [&](void *d_temp_storage, size_t &temp_storage_bytes) {
+                cub::DeviceReduce::Max(d_temp_storage,
+                                       temp_storage_bytes,
+                                       _postprocess_buf.data().get(),
+                                       _d_output_max,
+                                       _postprocess_buf.size(),
+                                       _compute_stream);
+            });
+
+            cudaMemcpyAsync(_h_output_max, _d_output_max, sizeof(double), cudaMemcpyDeviceToHost, _compute_stream);
         }
 
         {
             nvtx3::scoped_range r(("Fill output: " + std::to_string(_host_buf_pos) + " to " + std::to_string(_host_buf_pos + _last_batch_size * _freq_bin_end)));
-
+            cudaStreamWaitEvent(_data_xfer_stream, _compute_complete);
             cudaMemcpyAsync(thrust::raw_pointer_cast(_host_output_buf.data().get()) + _host_buf_pos,
                             thrust::raw_pointer_cast(_postprocess_buf.data().get()),
                             sizeof(double) * _batch_size * _freq_bin_end,
@@ -392,7 +411,7 @@ public:
     size_t get_window_size() const { return _window_size; }
     float get_hz_per_bin() const { return _hz_per_bin; }
     size_t get_hop_size() const { return _hop_size; }
-    double get_output_max() const { return _h_output_max; }
+    double get_output_max() const { return *_h_output_max; }
 
     void synchronize()
     {
