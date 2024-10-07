@@ -4,7 +4,9 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/usr/local/cuda/include"
+                "/usr/local/cuda/include",
+                "/usr/include/x86_64-linux-gnu/qt5/**",
+                "/usr/include/qwt"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
