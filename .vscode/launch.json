@@ -8,7 +8,43 @@
             "name": "CUDA C++: Launch",
             "type": "cuda-gdb",
             "request": "launch",
-            "program": "${workspaceFolder}/build/02_cub_fractal/cub_fractal"
+            "program": "${workspaceFolder}/build/03_sine_waves/audio_fft",
+            "cwd": "${workspaceRoot}",
+            "args": [
+                "~/video.mp4"
+            ],
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "GDB Launch",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/03_sine_waves/audio_fft",
+            "cwd": "${workspaceRoot}",
+            "args": [
+                "~/video.mp4"
+            ],
+            "miDebuggerPath": "/usr/bin/gdb",
+            "stopAtEntry": true,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ]
         }
     ]
 }
