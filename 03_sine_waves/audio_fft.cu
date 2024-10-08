@@ -8,6 +8,7 @@
 #include <QString>
 #include <fstream>
 #include <iostream>
+#include <omp.h>
 #include <opencv2/opencv.hpp>
 #include <qwt_plot.h>
 #include <qwt_plot_curve.h>
@@ -38,16 +39,79 @@ void write_csv(std::string filename, std::vector<float> &data)
     }
 }
 
-void draw_spectrogram_animation(const std::string &filename, const std::unique_ptr<DeviceFFT> &fft)
+template <typename T>
+T condense_fft_to_notes(const std::unique_ptr<DeviceFFT> &fft, const std::vector<T> &piano_notes, std::vector<T> &condensed_data)
+{
+    nvtx3::scoped_range r("Condense FFT to notes");
+    constexpr int num_notes = 88;
+    condensed_data.resize((fft->_host_output_buf.size() / fft->get_num_bins()) * num_notes);
+
+    float hz_per_bin = fft->get_hz_per_bin();
+
+    T max = 0.0;
+
+#pragma omp parallel for schedule(dynamic) reduction(max : max)
+    for (int window = 0; window < (fft->_host_output_buf.size() / fft->get_num_bins()); ++window) {
+        for (auto it = piano_notes.begin(); it != piano_notes.end(); it++) {
+            auto next_it = std::next(it);
+
+            // Upper and lower bound as frequencies
+            float lower_bound = (it == piano_notes.begin()) ? 0 : (*it + *std::prev(it)) / 2;
+            float upper_bound = (next_it == piano_notes.end()) ? fft->get_hz_per_bin() * fft->get_num_bins() : (*it + *next_it) / 2;
+
+            // Upper and lower bounds as bin indices
+            int lower_bin = static_cast<int>(std::floor(lower_bound / hz_per_bin));
+            int upper_bin = static_cast<int>(std::ceil(upper_bound / hz_per_bin));
+
+            if (upper_bin > fft->get_num_bins()) {
+                upper_bin = fft->get_num_bins();
+            }
+
+            // Iterate over the bins and sum up their values
+            T note_value = 0.0;
+            for (int bin = lower_bin; bin < upper_bin; bin++) {
+                note_value += fft->_host_output_buf[window * fft->get_num_bins() + bin];
+            }
+
+#pragma omp critical
+            {
+                max                                       = std::max(note_value, max);
+                auto note_offset                          = std::distance(piano_notes.begin(), it);
+                condensed_data[window * 88 + note_offset] = note_value;
+            }
+        }
+    }
+
+    return max;
+}
+
+void draw_spectrogram_animation(const std::string &filename, const std::unique_ptr<DeviceFFT> &fft, bool condense_to_notes = false)
 {
     int num_bins = fft->get_num_bins();
 
-    std::vector<double> frequencies(num_bins);
-    for (int i = 0; i < frequencies.size(); i++) {
-        frequencies[i] = i * fft->get_hz_per_bin();
-    }
+    std::vector<double> frequencies;
+    double *data_ptr;
 
-    double max = fft->get_output_max();
+    std::vector<double> condensed_data;
+    double max;
+
+    if (condense_to_notes) {
+        for (int i = 0; i < 88; i++) {
+            float note_freq = 27.5f * pow(2.0f, static_cast<float>(i) / 12.0f);
+            frequencies.push_back(note_freq);
+        }
+        num_bins = 88;
+        max      = condense_fft_to_notes<double>(fft, frequencies, condensed_data);
+        data_ptr = condensed_data.data();
+    }
+    else {
+        frequencies.resize(fft->get_num_bins());
+        for (int i = 0; i < frequencies.size(); i++) {
+            frequencies[i] = i * fft->get_hz_per_bin();
+        }
+        data_ptr = static_cast<double *>(thrust::raw_pointer_cast(fft->_host_output_buf.data()));
+        max      = fft->get_output_max();
+    }
 
     nvtxRangePushA("Set up plot");
     // Create the plot
@@ -72,6 +136,10 @@ void draw_spectrogram_animation(const std::string &filename, const std::unique_p
 
     std::unique_ptr<QwtPlotCurve> curve = std::make_unique<QwtPlotCurve>();
     curve->setPen(QPen(Qt::blue, 3, Qt::SolidLine));
+    if (condense_to_notes) {
+        // Draw curve as steps for better clarity at low res
+        curve->setStyle(QwtPlotCurve::Steps);
+    }
     curve->attach(&plot);
 
     QwtPlotRenderer renderer;
@@ -95,19 +163,24 @@ void draw_spectrogram_animation(const std::string &filename, const std::unique_p
     cv::Mat mat(image.height(), image.width(), CV_8UC4);
     cv::Mat bgr_mat;
 
-    for (int frame = 0; frame < fft->_host_output_buf.size() / num_bins; ++frame) {
+#pragma omp parallel for schedule(dynamic) private(mat, bgr_mat, image)
+    for (int frame = 0; frame < fft->_host_output_buf.size() / fft->get_num_bins(); ++frame) {
         nvtx3::scoped_range r("Process frame " + std::to_string(frame));
         if (frame % 100 == 0) {
-            std::cout << "Processing frame: " << frame << "/" << fft->_host_output_buf.size() / num_bins << std::endl;
+#pragma omp critical
+            std::cout << "Processing frame: " << frame << "/" << fft->_host_output_buf.size() / fft->get_num_bins() << std::endl;
         }
 
         // Set samples for the curve (this may involve allocations depending on curve implementation)
+#pragma omp critical
         curve->setSamples(frequencies.data(),
-                          static_cast<double *>(thrust::raw_pointer_cast(fft->_host_output_buf.data())) + frame * num_bins,
+                          data_ptr + frame * num_bins,
                           num_bins);
 
         // Render plot without recreating pixmap, painter, or QImage
+#pragma omp critical
         plot.replot();
+#pragma omp critical
         renderer.render(&plot, &painter, plot.geometry());
         image = pixmap.toImage(); // Reset the image without reallocating pixmap
 
@@ -115,7 +188,8 @@ void draw_spectrogram_animation(const std::string &filename, const std::unique_p
             nvtx3::scoped_range r2("Write mat to video");
             mat = cv::Mat(image.height(), image.width(), CV_8UC4, const_cast<uchar *>(image.bits()), image.bytesPerLine());
             cv::cvtColor(mat, bgr_mat, cv::COLOR_BGRA2BGR); // Reuse bgr_mat
-            video.write(bgr_mat);                           // Write the frame to the video
+#pragma omp critical
+            video.write(bgr_mat); // Write the frame to the video
         }
     }
 }
@@ -124,7 +198,17 @@ void draw_spectrogram_image(const std::string &filename, const std::unique_ptr<D
 {
     nvtx3::scoped_range r("Image Creation");
 
-    cv::Mat image(full_length / hop_size, fft->get_num_bins(), CV_32F, fft->_host_output_buf.data().get());
+    // Create a new vector to hold consolidated note values
+    std::vector<float> piano_spectrum((fft->_host_output_buf.size() / fft->get_num_bins()) * 88, 0.0f);
+    std::vector<float> piano_notes;
+    for (int i = 0; i < 88; i++) {
+        float note_freq = 27.5f * pow(2.0f, static_cast<float>(i) / 12.0f);
+        piano_notes.push_back(note_freq);
+    }
+
+    condense_fft_to_notes<float>(fft, piano_notes, piano_spectrum);
+
+    cv::Mat image(piano_spectrum.size() / 88, 88, CV_32F, piano_spectrum.data());
     cv::Mat normalized_image;
     cv::normalize(image, normalized_image, 0, 255, cv::NORM_MINMAX, CV_32F);
 
@@ -188,7 +272,7 @@ int main(int argc, char **argv)
             frame_count++;
             bool last_frame = (frame_count == (extractor.total_frames() - 1)) ? true : false;
             if (fft->add_sample(reinterpret_cast<float *>(frame->data[0]), frame->nb_samples, last_frame)) {
-                fft->run_batch_fft(true, true);
+                fft->run_batch_fft(false, true);
             }
         }
     }
@@ -204,7 +288,7 @@ int main(int argc, char **argv)
     // write_csv("raw.csv", fft->_host_output_buf);
 
     // Uncomment below to write an animation of all FFT output values across frames
-    draw_spectrogram_animation("animation.mp4", fft);
+    draw_spectrogram_animation("animation.mp4", fft, true);
 
     // Uncomment below to save the entire spectrogram as a PNG image
     draw_spectrogram_image("spectrogram.png", fft, full_length, hop_size);
